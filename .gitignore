@@ -1,0 +1,37 @@
+# Gradle
+.gradle/
+**/build/
+build/
+
+# 构建产物（release/debug APK、AAB 等）
+release/
+debug/
+*.apk
+*.aab
+
+# 本地配置（含 SDK 路径，勿提交）
+local.properties
+
+# IDE
+*.iml
+.idea/
+.kotlin/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android
+/captures
+.externalNativeBuild
+.cxx
+
+# 密钥（勿提交）
+*.jks
+*.keystore
+
+# 日志
+*.log
+
+# 签名密钥 base64（勿提交）
+release.jks.b64

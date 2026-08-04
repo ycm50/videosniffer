@@ -1,0 +1,71 @@
+name: Release Build
+
+# 手动触发构建发布（Actions 页点 "Run workflow"）
+# 版本自动递增：v1.0 -> v1.1 -> ... -> v1.9 -> v2.0 -> ... -> v2.9 -> v3.0
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（含历史标签）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 计算下一个版本号（tag 递增）
+        id: version
+        shell: bash
+        run: |
+          # 取形如 vX.Y 的最新标签
+          latest=$(git tag -l 'v[0-9]*.[0-9]*' | sed 's/^v//' | sort -t. -k1,1n -k2,2n | tail -1)
+          if [ -z "$latest" ]; then
+            major=1; minor=0
+          else
+            major=${latest%%.*}
+            minor=${latest##*.}
+            minor=$((minor + 1))
+            if [ $minor -ge 10 ]; then minor=0; major=$((major + 1)); fi
+          fi
+          next="${major}.${minor}"
+          code=$((major * 10 + minor))
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
+          echo "本次版本: v${next} (versionCode=$code)"
+
+      - name: 准备签名密钥（固定内嵌）
+        run: |
+          echo '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' | base64 -d > /tmp/release.keystore
+          echo "KEYSTORE_PATH=/tmp/release.keystore" >> "$GITHUB_ENV"
+          echo "使用固定签名密钥（密码 123456）"
+
+      - name: 构建 release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -PVERSION_NAME="${{ steps.version.outputs.next }}" \
+            -PVERSION_CODE="${{ steps.version.outputs.code }}"
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          echo "上传 APK: $APK"
+          gh release create "${{ steps.version.outputs.tag }}" "$APK" \
+            --title "Release ${{ steps.version.outputs.tag }}" \
+            --generate-notes

@@ -1,0 +1,62 @@
+<resources>
+    <string name="app_name">嗅探下载</string>
+
+    <!-- 底部导航 -->
+    <string name="nav_browser">浏览器</string>
+    <string name="nav_downloads">下载</string>
+    <string name="nav_settings">设置</string>
+
+    <!-- 浏览器页 -->
+    <string name="browser_hint">输入网址或搜索</string>
+    <string name="action_back">后退</string>
+    <string name="action_forward">前进</string>
+    <string name="action_refresh">刷新</string>
+
+    <!-- 嗅探下载 -->
+    <string name="download">下载</string>
+    <string name="dialog_quality_title">选择清晰度</string>
+    <string name="dialog_start_download">开始下载</string>
+    <string name="cancel">取消</string>
+    <string name="download_original">原画</string>
+
+    <!-- 下载服务通知 -->
+    <string name="notification_channel">下载进度</string>
+    <string name="notification_preparing">准备下载…</string>
+    <string name="notification_downloading">%1$s 下载中 %2$s</string>
+    <string name="notification_exporting">%1$s 导出中…</string>
+
+    <!-- 下载列表 -->
+    <string name="downloads_empty">暂无下载任务</string>
+    <string name="downloads_title">下载管理</string>
+    <string name="action_pause">暂停</string>
+    <string name="action_resume">继续</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_delete">删除</string>
+    <string name="action_retry">重试</string>
+    <string name="action_open">打开</string>
+    <string name="progress_0">0%</string>
+    <string name="progress_pct">%1$d%%</string>
+    <string name="meta_m3u8">%1$s · %2$d/%3$d 分片%4$s</string>
+    <string name="format_connections">%1$d 连接</string>
+    <string name="status_downloading">下载中</string>
+    <string name="status_paused">已暂停</string>
+    <string name="status_completed">已完成</string>
+    <string name="status_failed">失败</string>
+    <string name="status_exporting">导出中</string>
+    <string name="status_probing">探测中</string>
+    <string name="status_pending">等待中</string>
+    <string name="status_canceled">已取消</string>
+
+    <!-- 设置页 -->
+    <string name="settings_thread_count">下载线程数</string>
+    <string name="settings_max_tasks">同时下载任务数</string>
+    <string name="settings_initial_page">初始网站</string>
+    <string name="settings_initial_page_hint">启动时浏览器打开的网址</string>
+    <string name="settings_save">保存</string>
+    <string name="settings_saved">设置已保存</string>
+    <string name="settings_download_dir_hint">下载目录：手机存储/Download/hanime1/</string>
+
+    <!-- 占位页 -->
+    <string name="downloads_placeholder">下载管理（M3/M5 实现）</string>
+    <string name="settings_placeholder">设置页（M5 实现）</string>
+</resources>
