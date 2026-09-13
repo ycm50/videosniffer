@@ -15,6 +15,10 @@
     <!-- 嗅探下载 -->
     <string name="download">下载</string>
     <string name="dialog_quality_title">选择清晰度</string>
+    <!-- 对话框条目：作品名 · 清晰度 · 大小 · 格式 -->
+    <string name="dialog_quality_item">%1$s · %2$s · %3$s · %4$s</string>
+    <string name="unnamed_media">未命名视频</string>
+    <string name="size_unknown">大小未知</string>
     <string name="dialog_start_download">开始下载</string>
     <string name="cancel">取消</string>
     <string name="download_original">原画</string>
@@ -22,6 +26,7 @@
     <!-- 下载服务通知 -->
     <string name="notification_channel">下载进度</string>
     <string name="notification_preparing">准备下载…</string>
+    <string name="notification_queued">%1$s 排队中…</string>
     <string name="notification_downloading">%1$s 下载中 %2$s</string>
     <string name="notification_exporting">%1$s 导出中…</string>
 
@@ -34,10 +39,12 @@
     <string name="action_delete">删除</string>
     <string name="action_retry">重试</string>
     <string name="action_open">打开</string>
+    <string name="action_clear_finished">清空已结束</string>
     <string name="progress_0">0%</string>
     <string name="progress_pct">%1$d%%</string>
     <string name="meta_m3u8">%1$s · %2$d/%3$d 分片%4$s</string>
     <string name="format_connections">%1$d 连接</string>
+    <string name="format_error">失败原因：%1$s</string>
     <string name="status_downloading">下载中</string>
     <string name="status_paused">已暂停</string>
     <string name="status_completed">已完成</string>
@@ -45,7 +52,12 @@
     <string name="status_exporting">导出中</string>
     <string name="status_probing">探测中</string>
     <string name="status_pending">等待中</string>
+    <string name="status_queued">排队中</string>
     <string name="status_canceled">已取消</string>
+    <string name="toast_file_missing">文件不存在</string>
+    <string name="toast_no_player">无可用播放器</string>
+    <string name="toast_enqueued">已加入下载：%1$s</string>
+    <string name="toast_all_candidates_filtered">已忽略本页小于 1 MB 的候选（疑似广告/预告）</string>
 
     <!-- 设置页 -->
     <string name="settings_thread_count">下载线程数</string>
@@ -54,9 +66,9 @@
     <string name="settings_initial_page_hint">启动时浏览器打开的网址</string>
     <string name="settings_save">保存</string>
     <string name="settings_saved">设置已保存</string>
+    <string name="settings_initial_page_applied">已切换到新网站</string>
+    <string name="settings_desktop_mode">电脑版网页</string>
+    <string name="settings_desktop_mode_hint">用电脑版 UA 与桌面视口加载页面，适合只在桌面端提供完整内容的站点。保存后浏览器页会自动重新加载生效</string>
+    <string name="settings_desktop_applied">已保存电脑版设置，浏览器页将重新加载</string>
     <string name="settings_download_dir_hint">下载目录：手机存储/Download/hanime1/</string>
-
-    <!-- 占位页 -->
-    <string name="downloads_placeholder">下载管理（M3/M5 实现）</string>
-    <string name="settings_placeholder">设置页（M5 实现）</string>
 </resources>

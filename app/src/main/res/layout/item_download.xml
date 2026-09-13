@@ -38,6 +38,16 @@
         android:textColor="?android:attr/textColorSecondary"
         android:textSize="12sp" />
 
+    <!-- 失败原因：仅失败任务显示 -->
+    <TextView
+        android:id="@+id/tv_error"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="#D32F2F"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

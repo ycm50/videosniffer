@@ -5,18 +5,31 @@ import androidx.lifecycle.viewModelScope
 import com.videosniffer.sniff.DetectedMedia
 import com.videosniffer.sniff.Hanime1DownloadParser
 import com.videosniffer.sniff.MediaUrlDetector
+import com.videosniffer.sniff.PageParser
 import com.videosniffer.sniff.PornhubParser
 import com.videosniffer.sniff.YouTubeParser
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 浏览器页 ViewModel：
- * 汇总嗅探到的媒体资源（Route D 下载页解析 + Route A 请求级检测），
+ * 汇总嗅探到的媒体资源（Route D 页面解析 + Route A 请求级检测），
  * 以 StateFlow 暴露给 UI 控制下载按钮显隐与清晰度选择。
+ *
+ * 去重与限流：
+ * - `observedUrls` 保证同一 URL 只做一次 HEAD 校验；
+ * - `probeSemaphore` 给并发校验设上限，避免页面里大量 .mp4 资源把请求打爆；
+ * - Route A 的候选 URL 先攒 600ms 再批量校验，避开页面加载期的请求风暴。
  */
 class BrowserViewModel : ViewModel() {
 
@@ -27,25 +40,52 @@ class BrowserViewModel : ViewModel() {
     private val _downloadRequest = MutableSharedFlow<List<DetectedMedia>>(extraBufferCapacity = 1)
     val downloadRequest = _downloadRequest.asSharedFlow()
 
+    /** 一次性事件：本页候选全部因过小被过滤（提示用户，避免「什么都没发生」） */
+    private val _filteredNotice = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val filteredNotice = _filteredNotice.asSharedFlow()
+
+    /** Route D 解析器。hanime1 放最后作为兜底（其 matches 已限定站点，不会误伤）。 */
+    private val parsers: List<PageParser> = listOf(YouTubeParser, PornhubParser, Hanime1DownloadParser)
+
+    /** 已提交过 HEAD 校验的 URL（含成功与失败），避免重复请求 */
+    private val observedUrls: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    /** 已加入列表的 URL */
+    private val acceptedUrls: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    /** Route A 校验并发上限 */
+    private val probeSemaphore = Semaphore(MAX_CONCURRENT_PROBES)
+
+    /** 本页已发起的 HEAD 校验数（配额用尽后不再新增） */
+    private val probesLaunched = AtomicInteger(0)
+
+    /** 本页因体积过小被丢弃的候选数 */
+    private val rejectedThisPage = AtomicInteger(0)
+
+    /** 本页是否至少产出了一个可用候选 */
+    @Volatile
+    private var pageAccepted = false
+
+    private val pendingUrls = mutableListOf<String>()
+    private var flushJob: Job? = null
+
     /**
      * 页面加载完成回调（主线程）。
      * 按站点分发到对应解析器，取回媒体直链（Route D）。
      */
     fun onPageFinished(url: String, title: String?) {
-        val parser = when {
-            Hanime1DownloadParser.isWatchUrl(url) -> null
-            YouTubeParser.matches(url) -> YouTubeParser
-            PornhubParser.matches(url) -> PornhubParser
-            else -> return
-        }
+        // 新页面：重置 Route A 的单页校验配额。
+        // 必须放在这里而不只是 onPageStarted —— SPA（history.pushState）与同文档跳转
+        // 不会触发 onPageStarted，配额若只在导航时重置会永久耗尽，之后再也嗅不到资源。
+        probesLaunched.set(0)
+        rejectedThisPage.set(0)
+        pageAccepted = false
+        val parser = parsers.firstOrNull { it.matches(url) } ?: return
         viewModelScope.launch {
-            val parsed = if (parser != null) {
-                parser.parse(url, title)
-            } else {
-                Hanime1DownloadParser.parseWatchUrl(url, title)
-            }
+            val parsed = parser.parse(url, title)
             if (parsed.isNotEmpty()) {
-                _mediaList.value = merge(_mediaList.value, parsed)
+                addMedia(parsed)
+                notifyIfAllFiltered()
             }
         }
     }
@@ -58,35 +98,161 @@ class BrowserViewModel : ViewModel() {
         viewModelScope.launch {
             val parsed = Hanime1DownloadParser.parseDownloadPage(url, referer, title)
             if (parsed.isNotEmpty()) {
-                _mediaList.value = merge(_mediaList.value, parsed)
+                addMedia(parsed)
                 _downloadRequest.emit(parsed)
             }
         }
     }
 
     /**
-     * WebView 请求级 URL 回调（后台线程）。
-     * 扩展名快速命中后，HEAD 校验 Content-Type；仅作为下载页解析失败时的兜底。
+     * WebView 请求级 URL 回调（在 WebView 的请求线程上被高频调用）。
+     *
+     * 这里只做「廉价字符串预筛 + 去重入队」，**不做 Uri 解析**：精确判定与 HEAD 校验
+     * 都推迟到 flush 协程，避免占用 WebView 请求线程拖慢页面资源加载。
+     * 预筛是有必要的 —— 否则每张图/每个 CSS 的 URL 都要进一次同步集合，开销反而更大。
      */
     fun onUrlObserved(url: String, sourcePageUrl: String, title: String?) {
-        if (!MediaUrlDetector.isVideoCandidate(url)) return
-        viewModelScope.launch {
-            val media = MediaUrlDetector.detect(url, sourcePageUrl, title) ?: return@launch
-            _mediaList.value = merge(_mediaList.value, listOf(media))
+        if (!looksLikeMedia(url)) return
+        // YouTube 播放器会带 range= 分块拉同一个流；先归一化成整片地址，
+        // 否则同一个视频的不同片段会被当成多个不同资源（还会各自发一次 HEAD）
+        val normalized = MediaUrlDetector.normalizeForDownload(url)
+        val enqueued = synchronized(observedUrls) {
+            when {
+                observedUrls.size >= MAX_OBSERVED_URLS -> false
+                observedUrls.add(normalized) -> {
+                    pendingUrls.add(normalized)
+                    true
+                }
+                else -> false
+            }
         }
+        if (enqueued) scheduleFlush(sourcePageUrl, title)
     }
 
     fun clear() {
         _mediaList.value = emptyList()
+        synchronized(observedUrls) {
+            observedUrls.clear()
+            acceptedUrls.clear()
+            pendingUrls.clear()
+        }
+        flushJob?.cancel()
+        flushJob = null
+        probesLaunched.set(0)
+        rejectedThisPage.set(0)
+        pageAccepted = false
     }
 
-    /** 按 URL 去重合并，新资源追加 */
-    private fun merge(current: List<DetectedMedia>, incoming: List<DetectedMedia>): List<DetectedMedia> {
-        val existingUrls = current.mapTo(mutableSetOf()) { it.url }
-        val merged = current.toMutableList()
-        incoming.forEach {
-            if (existingUrls.add(it.url)) merged.add(it)
+    // ---------- 内部 ----------
+
+    /**
+     * 攒一小段时间再统一校验，避免页面加载期的请求风暴。
+     *
+     * 采用「循环排空」而非「一次性 drain」：flush 期间新入队的 URL 会在下一轮被处理，
+     * 不存在因协程已完成而漏掉尾批的竞态。
+     */
+    private fun scheduleFlush(sourcePageUrl: String, title: String?) {
+        if (flushJob?.isActive == true) return
+        flushJob = viewModelScope.launch {
+            while (true) {
+                delay(FLUSH_DELAY_MS)
+                val batch = synchronized(observedUrls) {
+                    if (pendingUrls.isEmpty()) {
+                        null
+                    } else {
+                        val copy = pendingUrls.toList()
+                        pendingUrls.clear()
+                        copy
+                    }
+                } ?: break
+
+                batch.forEach { url ->
+                    // 在协程里做纯判定，快速筛掉非视频资源，避免无谓的 HEAD 请求
+                    if (MediaUrlDetector.isVideoCandidate(url)) {
+                        launchProbe(url, sourcePageUrl, title)
+                    }
+                }
+            }
         }
-        return merged
+    }
+
+    private fun launchProbe(url: String, sourcePageUrl: String, title: String?) {
+        // 单页配额：HLS/DASH 播放会产生成百上千个分片 URL，逐个 HEAD 等于对站点做请求放大。
+        // 配额在每次页面加载完成（onPageFinished）与 clear() 时重置。
+        if (probesLaunched.get() >= MAX_PROBES_PER_PAGE) return
+        probesLaunched.incrementAndGet()
+        viewModelScope.launch {
+            probeSemaphore.withPermit {
+                doProbe(url, sourcePageUrl, title)
+            }
+        }
+    }
+
+    /** 注意是 suspend：内部调用的 MediaUrlDetector.detect 会发起 HEAD 请求 */
+    private suspend fun doProbe(url: String, sourcePageUrl: String, title: String?) {
+        val media = MediaUrlDetector.detect(url, sourcePageUrl, title) ?: return
+        addMedia(listOf(media))
+        notifyIfAllFiltered()
+    }
+
+    /** 廉价预筛：只做大小写归一与子串匹配，不解析 URL。 */
+    private fun looksLikeMedia(url: String): Boolean {
+        val lower = url.lowercase()
+        return MEDIA_HINTS.any { lower.contains(it) }
+    }
+
+    /**
+     * 过滤 + 按 URL 去重合并，新资源追加。
+     *
+     * [_mediaList] 是 CAS 写入的 StateFlow，本方法会同时被多个 probe 协程调用，
+     * 因此整体加锁，保证「过滤-去重-追加」三步不会互相覆盖。
+     */
+    private fun addMedia(incoming: List<DetectedMedia>) {
+        val fresh = incoming.filter { it.isUsable() }
+        val rejected = incoming.size - fresh.size
+        if (rejected > 0) rejectedThisPage.addAndGet(rejected)
+
+        synchronized(observedUrls) {
+            val added = fresh.filter { acceptedUrls.add(it.url) }
+            if (added.isEmpty()) return
+            _mediaList.update { it + added }
+            pageAccepted = true
+        }
+    }
+
+    /**
+     * 本页所有候选都被体积阈值过滤掉时提示一次。
+     * 只在「已经有候选被拒」且「至今没有任何可用候选」时发事件 —— 避免正片与
+     * 广告同页时也弹提示。
+     */
+    private fun notifyIfAllFiltered() {
+        if (rejectedThisPage.get() > 0 && !pageAccepted) {
+            _filteredNotice.tryEmit(Unit)
+        }
+    }
+
+    /**
+     * 是否为「可用」的下载候选：已知大小小于 [MIN_MEDIA_BYTES] 的丢弃。
+     *
+     * 站点在下载页/播放页会插入广告与预告的短 mp4（0.1~0.7 MB），
+     * 它们在清晰度列表里和正片混在一起极易误选。
+     * 大小未知（无 Content-Length）时保留 —— 宁可多留一个，也不误杀正片。
+     */
+    private fun DetectedMedia.isUsable(): Boolean =
+        size == null || size >= MIN_MEDIA_BYTES
+
+    private companion object {
+        const val MAX_CONCURRENT_PROBES = 4
+        const val MAX_OBSERVED_URLS = 300
+
+        /** 单页最多发起多少次 HEAD 校验，防请求放大 */
+        const val MAX_PROBES_PER_PAGE = 60
+        const val FLUSH_DELAY_MS = 600L
+
+        /** 小于该大小的候选直接丢弃（广告/预告短 mp4） */
+        const val MIN_MEDIA_BYTES = 1024L * 1024L
+
+        /** 廉价预筛关键词：覆盖各站点常见的媒体 URL 形态 */
+        val MEDIA_HINTS = listOf("m3u8", ".mp4", ".ts", "videoplayback", ".flv", ".webm", ".m4s")
     }
 }

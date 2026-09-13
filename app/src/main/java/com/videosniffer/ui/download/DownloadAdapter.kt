@@ -17,10 +17,21 @@ import com.videosniffer.download.DownloadManager
 import com.videosniffer.download.DownloadState
 import com.videosniffer.download.DownloadTask
 
+/**
+ * 下载任务列表适配器。
+ *
+ * 列表由 [DownloadListFragment] 订阅 [DownloadManager.tasks] 驱动（每 300ms 一次进度），
+ * 因此：[notifyDataSetChanged] 会重绘可见项，速度按「最近一次采样」计算以保证平滑。
+ */
 class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
 
     private val items = mutableListOf<DownloadTask>()
-    private val lastSample = HashMap<String, Pair<Long, Long>>() // id -> (bytes, timeMs)
+
+    /** id -> (已下载字节, 采样时刻)，用于计算实时速度 */
+    private val lastSample = HashMap<String, Pair<Long, Long>>()
+
+    /** id -> 最近一次成功计算出的速度文本（采样过密时沿用，避免读数抖动） */
+    private val lastSpeed = HashMap<String, String>()
 
     fun submitList(list: List<DownloadTask>) {
         items.clear()
@@ -44,6 +55,7 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
         private val tvTitle = itemView.findViewById<TextView>(R.id.tv_title)
         private val tvStatus = itemView.findViewById<TextView>(R.id.tv_status)
         private val tvMeta = itemView.findViewById<TextView>(R.id.tv_meta)
+        private val tvError = itemView.findViewById<TextView>(R.id.tv_error)
         private val progressBar = itemView.findViewById<ProgressBar>(R.id.progress_bar)
         private val tvProgressPct = itemView.findViewById<TextView>(R.id.tv_progress_pct)
         private val btnPauseResume = itemView.findViewById<Button>(R.id.btn_pause_resume)
@@ -53,16 +65,18 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
         private val btnDelete = itemView.findViewById<Button>(R.id.btn_delete)
 
         fun bind(task: DownloadTask) {
+            val ctx = itemView.context
             tvTitle.text = task.title
 
-            tvStatus.text = statusText(task.state)
-            val isActive = task.state in setOf(
-                DownloadState.PENDING, DownloadState.PROBING,
-                DownloadState.DOWNLOADING, DownloadState.EXPORTING
+            tvStatus.text = statusText(ctx, task.state)
+            val isRunning = task.state in setOf(
+                DownloadState.PENDING, DownloadState.PROBING, DownloadState.DOWNLOADING
             )
+            val isWaiting = task.state == DownloadState.QUEUED
+            val isActive = isRunning || isWaiting
             val isM3u8 = task.type.equals("m3u8", true)
 
-            // 进度：mp4 按字节；m3u8 按分片数；总大小未知时用不确定进度动画
+            // 进度：优先按字节；m3u8 在字节数未知时退化为分片计数；都没有则不确定动画
             val pct: Int
             val indeterminate: Boolean
             if (task.totalBytes > 0) {
@@ -80,18 +94,20 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
             progressBar.isVisible = task.state != DownloadState.COMPLETED
 
             tvProgressPct.isVisible = !indeterminate && task.state != DownloadState.COMPLETED
-            tvProgressPct.text = itemView.context.getString(R.string.progress_pct, pct)
+            tvProgressPct.text = ctx.getString(R.string.progress_pct, pct)
 
             // 描述文本（含实时速度与并发连接数）
             val quality = task.quality ?: task.type
             val speed = if (isM3u8) "" else speedFor(task)
             val speedSuffix = speed.takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
             val conn = if (task.state == DownloadState.DOWNLOADING && task.activeConnections > 0) {
-                itemView.context.getString(R.string.format_connections, task.activeConnections)
-            } else ""
+                ctx.getString(R.string.format_connections, task.activeConnections)
+            } else {
+                ""
+            }
             val connSuffix = conn.takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
             val baseMeta = if (isM3u8) {
-                itemView.context.getString(
+                ctx.getString(
                     R.string.meta_m3u8, quality, task.downloadedBytes, task.totalBytes, speedSuffix
                 )
             } else {
@@ -99,9 +115,14 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
             }
             tvMeta.text = "$baseMeta$connSuffix"
 
+            // 失败原因（旧版从不展示，导致用户无从判断）
+            tvError.isVisible = task.state == DownloadState.FAILED && !task.error.isNullOrBlank()
+            tvError.text = task.error?.let { ctx.getString(R.string.format_error, it) }.orEmpty()
+
             // 暂停/继续
             btnPauseResume.isVisible = isActive || task.state == DownloadState.PAUSED
-            btnPauseResume.text = itemView.context.getString(
+            btnPauseResume.isEnabled = task.state != DownloadState.QUEUED
+            btnPauseResume.text = ctx.getString(
                 if (task.state == DownloadState.PAUSED) R.string.action_resume else R.string.action_pause
             )
             btnPauseResume.setOnClickListener {
@@ -126,28 +147,45 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
         }
     }
 
-    private fun statusText(state: DownloadState): String {
-        return when (state) {
-            DownloadState.PENDING -> "等待中"
-            DownloadState.PROBING -> "探测中"
-            DownloadState.DOWNLOADING -> "下载中"
-            DownloadState.EXPORTING -> "导出中"
-            DownloadState.PAUSED -> "已暂停"
-            DownloadState.COMPLETED -> "已完成"
-            DownloadState.FAILED -> "失败"
-            DownloadState.CANCELED -> "已取消"
+    private fun statusText(context: Context, state: DownloadState): String {
+        val res = when (state) {
+            DownloadState.QUEUED -> R.string.status_queued
+            DownloadState.PENDING -> R.string.status_pending
+            DownloadState.PROBING -> R.string.status_probing
+            DownloadState.DOWNLOADING -> R.string.status_downloading
+            DownloadState.EXPORTING -> R.string.status_exporting
+            DownloadState.PAUSED -> R.string.status_paused
+            DownloadState.COMPLETED -> R.string.status_completed
+            DownloadState.FAILED -> R.string.status_failed
+            DownloadState.CANCELED -> R.string.status_canceled
         }
+        return context.getString(res)
     }
 
+    /**
+     * 实时速度：基于最近一次有效采样与当前值的时间差计算。
+     *
+     * 注意：间隔不足 [MIN_SAMPLE_INTERVAL_MS] 时**不能**刷新采样参考点，
+     * 否则参考点被不断前移，速度永远算不出来（列表每 300ms 刷新一次，
+     * 而 bind 可能因滚动等原因更频繁触发）。
+     */
     private fun speedFor(task: DownloadTask): String {
         if (task.state != DownloadState.DOWNLOADING) return ""
         val now = System.currentTimeMillis()
         val prev = lastSample[task.id]
+        if (prev == null) {
+            lastSample[task.id] = task.downloadedBytes to now
+            return ""
+        }
+        val elapsed = now - prev.second
+        if (elapsed < MIN_SAMPLE_INTERVAL_MS) return lastSpeed[task.id].orEmpty()
+
         lastSample[task.id] = task.downloadedBytes to now
-        if (prev == null || now <= prev.second) return "0 KB/s"
         val deltaBytes = task.downloadedBytes - prev.first
-        if (deltaBytes <= 0) return "0 KB/s"
-        return formatSpeed(deltaBytes * 1000.0 / (now - prev.second))
+        if (deltaBytes <= 0) return lastSpeed[task.id].orEmpty()
+        val speed = formatSpeed(deltaBytes * 1000.0 / elapsed)
+        lastSpeed[task.id] = speed
+        return speed
     }
 
     private fun formatSize(downloaded: Long, total: Long): String {
@@ -174,7 +212,7 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
     private fun openFile(context: Context, task: DownloadTask) {
         val fp = task.filePath ?: return
         if (!fp.startsWith("content://")) {
-            Toast.makeText(context, "文件不存在", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, R.string.toast_file_missing, Toast.LENGTH_SHORT).show()
             return
         }
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -182,6 +220,11 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         runCatching { context.startActivity(intent) }
-            .onFailure { Toast.makeText(context, "无可用播放器", Toast.LENGTH_SHORT).show() }
+            .onFailure { Toast.makeText(context, R.string.toast_no_player, Toast.LENGTH_SHORT).show() }
+    }
+
+    private companion object {
+        /** 同一任务两次速度采样之间的最小间隔 */
+        const val MIN_SAMPLE_INTERVAL_MS = 300L
     }
 }

@@ -2,10 +2,15 @@ package com.videosniffer.download
 
 /**
  * 下载任务状态。
- * PAUSED 保留进度与文件可续传；CANCELED 删除记录与文件。
+ *
+ * 生命周期：
+ * `QUEUED → PENDING → PROBING → DOWNLOADING → EXPORTING → COMPLETED`
+ * 中途可进入 `PAUSED`（保留进度与文件，可续传）/ `FAILED`（可重试）/ `CANCELED`（删记录与文件）。
+ *
+ * QUEUED 表示「已入队但未占用并发槽位」，由 [DownloadManager] 按「同时下载任务数」设置补位启动。
  */
 enum class DownloadState {
-    PENDING, PROBING, DOWNLOADING, EXPORTING, PAUSED, COMPLETED, FAILED, CANCELED
+    QUEUED, PENDING, PROBING, DOWNLOADING, EXPORTING, PAUSED, COMPLETED, FAILED, CANCELED
 }
 
 /**
@@ -27,7 +32,7 @@ data class DownloadTask(
     /** 下载中实际持有的并发连接数（由下载器实时更新） */
     var activeConnections: Int = 0,
     var filePath: String? = null,
-    var state: DownloadState = DownloadState.PENDING,
+    var state: DownloadState = DownloadState.QUEUED,
     var error: String? = null,
     val createdAt: Long = System.currentTimeMillis()
 )

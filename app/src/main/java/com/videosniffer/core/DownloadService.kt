@@ -30,19 +30,32 @@ class DownloadService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    /** 上一次实际提交的通知内容，用于跳过无变化的重建 */
+    private var lastNotificationText: String? = null
+    private var lastNotificationProgress: Int = Int.MIN_VALUE
+
     override fun onCreate() {
         super.onCreate()
+        // START_STICKY 下系统可能在没有 Activity 的情况下重建本服务（进程被杀后）。
+        // 此时 DownloadManager 尚未初始化，若不在这里兜底：
+        //   - pumpQueue() 会因 !initialized 直接返回，排队任务永远不启动；
+        //   - tasks 仍是空列表 → 下面的收集器立刻 stopSelf()，服务刚起来就自杀。
+        // init() 幂等，重复调用无副作用。
+        DownloadManager.init(this)
         createChannel()
         startAsForeground(getString(R.string.notification_preparing), -1)
         scope.launch {
             DownloadManager.tasks.collectLatest { tasks ->
+                // 排队中也要保持前台服务（否则等待补位的任务会被系统回收）
                 val active = tasks.firstOrNull {
                     it.state in setOf(
-                        DownloadState.PENDING, DownloadState.PROBING,
+                        DownloadState.QUEUED, DownloadState.PENDING, DownloadState.PROBING,
                         DownloadState.DOWNLOADING, DownloadState.EXPORTING
                     )
                 }
                 if (active == null) {
+                    // 无存活任务（含无任务）时由本收集器统一停服，
+                    // 不再由调度器并发判断，避免把刚启动的服务杀掉
                     stopSelf()
                 } else {
                     updateNotification(active)
@@ -74,16 +87,26 @@ class DownloadService : Service() {
     }
 
     private fun updateNotification(task: DownloadTask) {
-        val pct = if (task.totalBytes > 0) {
+        val waiting = task.state == DownloadState.QUEUED || task.state == DownloadState.PENDING
+        val pct = if (task.totalBytes > 0 && !waiting) {
             ((task.downloadedBytes * 100L) / task.totalBytes).toInt().coerceIn(0, 100)
         } else {
             -1
         }
-        val text = if (task.state == DownloadState.EXPORTING) {
-            getString(R.string.notification_exporting, task.title)
-        } else {
-            getString(R.string.notification_downloading, task.title, if (pct >= 0) "$pct%" else "")
+        val text = when {
+            waiting -> getString(R.string.notification_queued, task.title)
+            task.state == DownloadState.EXPORTING ->
+                getString(R.string.notification_exporting, task.title)
+            else -> getString(
+                R.string.notification_downloading, task.title, if (pct >= 0) "$pct%" else ""
+            )
         }
+        // 进度每 300ms 上报一次，但百分比通常一两秒才变一格。
+        // 内容没变就跳过：否则会在主线程上每秒重建三次通知（startForeground 有实际开销）。
+        if (text == lastNotificationText && pct == lastNotificationProgress) return
+        lastNotificationText = text
+        lastNotificationProgress = pct
+
         val notification = buildNotification(text, pct)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(

@@ -50,10 +50,51 @@ class DownloadDbHelper(context: Context) :
         )
     }
 
+    /**
+     * 增量升级：只补齐缺失的列，**不清空既有数据**。
+     * 旧实现直接 DROP 两张表重建，会让用户所有下载记录与断点进度在版本升级后丢失。
+     */
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS shards")
-        db.execSQL("DROP TABLE IF EXISTS tasks")
-        onCreate(db)
+        val taskColumns = existingColumns(db, T_TASKS)
+        val shardColumns = existingColumns(db, T_SHARDS)
+
+        // 旧库没有这两张表时（异常场景）直接按新结构建
+        if (taskColumns.isEmpty() && shardColumns.isEmpty()) {
+            onCreate(db)
+            return
+        }
+
+        addColumnIfMissing(db, T_TASKS, taskColumns, "m3u8_url", "TEXT")
+        addColumnIfMissing(db, T_TASKS, taskColumns, "total_bytes", "INTEGER NOT NULL DEFAULT 0")
+        addColumnIfMissing(db, T_TASKS, taskColumns, "downloaded_bytes", "INTEGER NOT NULL DEFAULT 0")
+        addColumnIfMissing(db, T_TASKS, taskColumns, "file_path", "TEXT")
+        addColumnIfMissing(db, T_TASKS, taskColumns, "error", "TEXT")
+        addColumnIfMissing(db, T_TASKS, taskColumns, "created_at", "INTEGER NOT NULL DEFAULT 0")
+        addColumnIfMissing(db, T_SHARDS, shardColumns, "finished", "INTEGER NOT NULL DEFAULT 0")
+    }
+
+    private fun existingColumns(db: SQLiteDatabase, table: String): Set<String> {
+        val columns = mutableSetOf<String>()
+        runCatching {
+            db.rawQuery("PRAGMA table_info($table)", null).use { c ->
+                while (c.moveToNext()) {
+                    val name = c.getString(c.getColumnIndexOrThrow("name"))
+                    columns.add(name)
+                }
+            }
+        }
+        return columns
+    }
+
+    private fun addColumnIfMissing(
+        db: SQLiteDatabase,
+        table: String,
+        existing: Set<String>,
+        column: String,
+        definition: String
+    ) {
+        if (existing.isEmpty() || existing.contains(column)) return
+        runCatching { db.execSQL("ALTER TABLE $table ADD COLUMN $column $definition") }
     }
 
     // ---------- tasks ----------

@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.videosniffer.download.DownloadManager
@@ -15,6 +17,10 @@ import com.videosniffer.ui.settings.SettingsFragment
 class MainActivity : AppCompatActivity() {
 
     private var currentTag: String = TAG_BROWSER
+
+    /** 通知权限（仅用于下载进度通知，拒绝也不影响下载功能） */
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* 忽略结果 */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,10 +54,11 @@ class MainActivity : AppCompatActivity() {
 
     /** Android 13+ 请求通知权限（下载进度通知依赖） */
     private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATION)
-            }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -76,6 +83,5 @@ class MainActivity : AppCompatActivity() {
         private const val TAG_DOWNLOADS = "downloads"
         private const val TAG_SETTINGS = "settings"
         private const val STATE_CURRENT_TAG = "current_tag"
-        private const val REQ_NOTIFICATION = 100
     }
 }
