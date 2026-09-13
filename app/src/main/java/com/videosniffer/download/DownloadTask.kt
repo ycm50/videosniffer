@@ -17,6 +17,10 @@ enum class DownloadState {
  * 下载任务（单文件 mp4 或 m3u8 流）。
  *
  * @param type mp4 / m3u8
+ * @param totalBytes 进度**分母**：总字节数。mp4 来自 `Content-Length`；m3u8 由「实测码率 × 总时长」
+ *   **估算**（见 [DownloadProgress.estimateTotalBytes]），0 表示暂时估不出来（UI 走不确定进度）。
+ * @param downloadedBytes 进度**分子**：已下载字节数（m3u8 是真实值，且包含**正在下载**的分片，
+ *   所以进度是连续的，不是「下完一个分片跳一格」）。百分比一律交给 [DownloadProgress] 计算。
  */
 data class DownloadTask(
     val id: String,

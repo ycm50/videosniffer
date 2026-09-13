@@ -14,6 +14,7 @@ import androidx.core.view.isVisible
 import androidx.recyclerview.widget.RecyclerView
 import com.videosniffer.R
 import com.videosniffer.download.DownloadManager
+import com.videosniffer.download.DownloadProgress
 import com.videosniffer.download.DownloadState
 import com.videosniffer.download.DownloadTask
 
@@ -76,18 +77,24 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
             val isActive = isRunning || isWaiting
             val isM3u8 = task.type.equals("m3u8", true)
 
-            // 进度：优先按字节；m3u8 在字节数未知时退化为分片计数；都没有则不确定动画
+            // 进度：单位统一是字节（m3u8 的总量是估算值），计算口径唯一走 DownloadProgress。
+            // 总量未知（还没算出估算值 / 源没给 Content-Length）时走不确定动画。
+            val computed = DownloadProgress.displayPercent(task)
             val pct: Int
             val indeterminate: Boolean
-            if (task.totalBytes > 0) {
-                pct = ((task.downloadedBytes * 100L) / task.totalBytes).toInt().coerceIn(0, 100)
-                indeterminate = false
-            } else if (task.state == DownloadState.DOWNLOADING) {
-                pct = 0
-                indeterminate = true
-            } else {
-                pct = 0
-                indeterminate = false
+            when {
+                computed >= 0 -> {
+                    pct = computed
+                    indeterminate = false
+                }
+                task.state == DownloadState.DOWNLOADING -> {
+                    pct = 0
+                    indeterminate = true
+                }
+                else -> {
+                    pct = 0
+                    indeterminate = false
+                }
             }
             progressBar.isIndeterminate = indeterminate
             progressBar.progress = pct
@@ -96,23 +103,22 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
             tvProgressPct.isVisible = !indeterminate && task.state != DownloadState.COMPLETED
             tvProgressPct.text = ctx.getString(R.string.progress_pct, pct)
 
-            // 描述文本（含实时速度与并发连接数）
+            // 描述文本（含实时速度与并发连接数）。
+            // 进度单位统一是字节，所以 m3u8 也能显示已下载大小与实时速度
             val quality = task.quality ?: task.type
-            val speed = if (isM3u8) "" else speedFor(task)
-            val speedSuffix = speed.takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
+            val speedSuffix = speedFor(task).takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
             val conn = if (task.state == DownloadState.DOWNLOADING && task.activeConnections > 0) {
                 ctx.getString(R.string.format_connections, task.activeConnections)
             } else {
                 ""
             }
             val connSuffix = conn.takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
-            val baseMeta = if (isM3u8) {
-                ctx.getString(
-                    R.string.meta_m3u8, quality, task.downloadedBytes, task.totalBytes, speedSuffix
-                )
+            val sizeText = if (isM3u8) {
+                estimatedSize(task)
             } else {
-                "$quality · ${formatSize(task.downloadedBytes, task.totalBytes)}$speedSuffix"
+                formatSize(task.downloadedBytes, task.totalBytes)
             }
+            val baseMeta = ctx.getString(R.string.meta_download, quality, sizeText, speedSuffix)
             tvMeta.text = "$baseMeta$connSuffix"
 
             // 失败原因（旧版从不展示，导致用户无从判断）
@@ -191,6 +197,19 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
     private fun formatSize(downloaded: Long, total: Long): String {
         val d = formatBytes(downloaded)
         return if (total > 0) "$d / ${formatBytes(total)}" else d
+    }
+
+    /**
+     * m3u8 的大小文本。总量不是源给的，而是「实测码率 × playlist 总时长」的**估算值**
+     * （见 [DownloadProgress.estimateTotalBytes]），所以加 `~` 标注，避免被当成精确值。
+     */
+    private fun estimatedSize(task: DownloadTask): String {
+        val downloaded = formatBytes(task.downloadedBytes)
+        return if (task.totalBytes > 0) {
+            "$downloaded / ~${formatBytes(task.totalBytes)}"
+        } else {
+            downloaded
+        }
     }
 
     private fun formatBytes(bytes: Long): String {

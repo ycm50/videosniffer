@@ -42,7 +42,8 @@
     <string name="action_clear_finished">清空已结束</string>
     <string name="progress_0">0%</string>
     <string name="progress_pct">%1$d%%</string>
-    <string name="meta_m3u8">%1$s · %2$d/%3$d 分片%4$s</string>
+    <!-- 下载项副标题：清晰度 · 大小[ · 速度]；m3u8 的总量是估算值，显示为 ~x -->
+    <string name="meta_download">%1$s · %2$s%3$s</string>
     <string name="format_connections">%1$d 连接</string>
     <string name="format_error">失败原因：%1$s</string>
     <string name="status_downloading">下载中</string>

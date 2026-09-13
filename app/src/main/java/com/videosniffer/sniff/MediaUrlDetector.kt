@@ -1,6 +1,9 @@
 package com.videosniffer.sniff
 
 import android.net.Uri
+import com.videosniffer.download.hls.HlsPlaylist
+import com.videosniffer.download.hls.HlsVariant
+import com.videosniffer.download.hls.M3U8Parser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Request
@@ -131,85 +134,207 @@ object MediaUrlDetector {
         }
     }
 
+    /** `RESOLUTION=1920x1080` → 1080（用于变体排序）。纯函数，判不出返回 0。 */
+    fun heightOfResolution(resolution: String?): Int =
+        resolution?.substringAfter('x', "")?.trim()?.toIntOrNull() ?: 0
+
+    /** `RESOLUTION=1920x1080` → `1080p`。纯函数，判不出返回 null。 */
+    fun qualityForResolution(resolution: String?): String? =
+        heightOfResolution(resolution).takeIf { it > 0 }?.let { "${it}p" }
+
+    /** `1920x1080` 形态（URL 路径里也常见，如 `.../1920x1080/index.m3u8`） */
+    private val urlResolutionRegex = Regex("""(?<![0-9])(\d{3,4})x(\d{3,4})(?![0-9])""")
+
+    /** `1080p` / `720p60` 形态 */
+    private val urlHeightRegex =
+        Regex("""(?<![0-9])(\d{3,4})p(?:\d{1,3})?(?![0-9a-zA-Z])""", RegexOption.IGNORE_CASE)
+
     /**
-     * 校验真实类型，返回 DetectedMedia；非视频或请求失败返回 null。
-     * m3u8 站点常返回 application/octet-stream，需兜底按 URL 判断。
+     * 3~4 位数字 + `p` 的组合在 URL 里太常见（签名 token、时间戳都能碰上，如 `/a1234p/`），
+     * 故只认这些真实存在的清晰度高度。
      */
-    suspend fun detect(
+    private val commonHeights = setOf(144, 240, 360, 480, 540, 720, 1080, 1440, 2160, 4320)
+
+    /**
+     * 从 URL 路径推断清晰度：`/hls/1080p/index.m3u8` → `1080p`、`/1920x1080/x.ts` → `1080p`、
+     * `xxx-720p.mp4` → `720p`。纯函数（只用字符串操作，不碰 [Uri]，可直接 JVM 单测）；
+     * 判不出返回 null。
+     *
+     * 用途：master playlist 没给 `RESOLUTION`、或本来就是 media playlist（分辨率信息不可得）时兜底 ——
+     * 大量 CDN 会把清晰度写进目录名或文件名。
+     */
+    fun qualityFromUrlPath(url: String): String? {
+        val path = url.substringBefore('?').substringBefore('#')
+        urlResolutionRegex.find(path)?.let { match ->
+            val height = match.groupValues[2].toIntOrNull() ?: 0
+            if (height in commonHeights) return "${height}p"
+        }
+        val height = urlHeightRegex.find(path)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        return if (height in commonHeights) "${height}p" else null
+    }
+
+    /**
+     * 校验真实类型，返回该 URL 对应的**全部**下载候选。
+     *
+     * HLS master playlist 会**展开成多个候选**（每个 `#EXT-X-STREAM-INF` 变体一条，清晰度取
+     * `RESOLUTION`，如 `1080p`）—— 这就是「m3u8 也能识别/选择清晰度」的落地方式。
+     * 此前实现对这个位置**恒填 `quality = null`**，于是不论 master 里有几个清晰度，
+     * 对话框里都只显示一条「原画」，即「m3u8 清晰度识别无效」。
+     *
+     * 单个 URL 最多两次请求：HEAD 取类型 + 一次 GET 取 playlist 文本（顺带完成
+     * 「是不是真 playlist」的校验）。HEAD 失败时 m3u8 仍可凭 URL 与 GET 结果成功识别。
+     */
+    suspend fun detectAll(
         url: String,
         sourcePageUrl: String,
         title: String?
-    ): DetectedMedia? = withContext(Dispatchers.IO) {
+    ): List<DetectedMedia> = withContext(Dispatchers.IO) {
         try {
             val uri = Uri.parse(url)
             val host = uri.host.orEmpty().lowercase()
 
             // YouTube 流：mime/itag 在 query 里，直接解析，避免 HEAD 被反爬拒
             if (host.contains("googlevideo.com")) {
-                val mime = uri.getQueryParameter("mime")?.lowercase().orEmpty()
-                // 纯音频流（mime=audio%2Fmp4，如 itag 140/251）不是视频：
-                // 在视频下载器里给出「音频」选项只会误导用户
-                if (mime.startsWith("audio/")) return@withContext null
-                val ext = when {
-                    mime.startsWith("video/mp4") -> "mp4"
-                    mime.isBlank() -> "mp4"
-                    // webm 等容器不放行：导出链路固定写 MIME video/mp4 与 .mp4 后缀，
-                    // 放行只会产出「扩展名与内容不符」的文件（见 YouTubeParser 的同类取舍）
-                    else -> return@withContext null
-                }
-                val itag = uri.getQueryParameter("itag")?.toIntOrNull()
-                val quality = itag?.let { itagQualities[it] }
-                return@withContext DetectedMedia(url, quality, null, ext, title, sourcePageUrl)
+                return@withContext youtubeMedia(uri, url, title, sourcePageUrl)?.let { listOf(it) }
+                    ?: emptyList()
             }
 
-            val request = Request.Builder()
-                .url(url)
-                .method("HEAD", null)
-                .header("User-Agent", SnifferHttp.UA)
-                .header("Referer", sourcePageUrl)
-                .build()
-
-            SnifferHttp.client.newCall(request).execute().use { resp ->
-                val ext = extensionFor(url, resp.header("Content-Type"))
-                    ?: return@withContext null
-
-                // m3u8 需要确认是有效 playlist（防止误抓普通文本）
-                if (ext == "m3u8" && !isValidM3U8(url)) {
-                    return@withContext null
+            var mime: String? = null
+            var size: Long? = null
+            // HEAD 失败不致命：m3u8 可以靠 URL 特征 + playlist 内容自证
+            val headOk = runCatching {
+                val request = Request.Builder()
+                    .url(url)
+                    .method("HEAD", null)
+                    .header("User-Agent", SnifferHttp.UA)
+                    .header("Referer", sourcePageUrl)
+                    .build()
+                SnifferHttp.client.newCall(request).execute().use { resp ->
+                    mime = resp.header("Content-Type")
+                    size = resp.header("Content-Length")?.toLongOrNull()
                 }
+                true
+            }.getOrDefault(false)
 
-                val size = resp.header("Content-Length")?.toLongOrNull()
+            val ext = extensionFor(url, mime) ?: return@withContext emptyList()
+
+            if (ext == "m3u8") {
+                val text = fetchPlaylistText(url) ?: return@withContext emptyList()
+                return@withContext candidatesForPlaylist(text, url, title, sourcePageUrl)
+            }
+
+            // 非 m3u8：以 HEAD 成功为准。拿不到类型说明资源不可达，给候选只会在下载时才失败
+            if (!headOk) return@withContext emptyList()
+            listOf(
                 DetectedMedia(
                     url = url,
-                    quality = null,
+                    quality = qualityFromUrlPath(url),
                     size = size,
                     ext = ext,
                     title = title,
                     sourcePageUrl = sourcePageUrl
                 )
-            }
+            )
         } catch (_: Exception) {
-            null
+            emptyList()
         }
     }
 
-    /** 下载 m3u8 文本，检查是否以 #EXTM3U 开头 */
-    private fun isValidM3U8(url: String): Boolean {
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .header("User-Agent", SnifferHttp.UA)
-                .build()
-            SnifferHttp.client.newCall(request).execute().use { resp ->
-                // 不用 `return false`：在 use{} 内是非局部返回，会绕过外层 catch
-                if (!resp.isSuccessful) {
-                    false
-                } else {
-                    resp.body?.string().orEmpty().contains("#EXTM3U")
-                }
-            }
-        } catch (_: Exception) {
-            false
+    /**
+     * 单条候选版本，供 hanime1 下载页这类「一个链接 = 一个候选」的场景使用。
+     * HLS master 会先展开，这里取最清晰的那条（展开结果已按带宽/高度降序）。
+     */
+    suspend fun detect(url: String, sourcePageUrl: String, title: String?): DetectedMedia? =
+        detectAll(url, sourcePageUrl, title).firstOrNull()
+
+    /** YouTube googlevideo 直链 → 候选；纯音频流与非 mp4 容器返回 null。 */
+    private fun youtubeMedia(
+        uri: Uri,
+        url: String,
+        title: String?,
+        sourcePageUrl: String
+    ): DetectedMedia? {
+        val mime = uri.getQueryParameter("mime")?.lowercase().orEmpty()
+        // 纯音频流（mime=audio%2Fmp4，如 itag 140/251）不是视频：
+        // 在视频下载器里给出「音频」选项只会误导用户
+        if (mime.startsWith("audio/")) return null
+        val ext = when {
+            mime.startsWith("video/mp4") -> "mp4"
+            mime.isBlank() -> "mp4"
+            // webm 等容器不放行：导出链路固定写 MIME video/mp4 与 .mp4 后缀，
+            // 放行只会产出「扩展名与内容不符」的文件（见 YouTubeParser 的同类取舍）
+            else -> return null
         }
+        val itag = uri.getQueryParameter("itag")?.toIntOrNull()
+        return DetectedMedia(url, itag?.let { itagQualities[it] }, null, ext, title, sourcePageUrl)
+    }
+
+    /**
+     * playlist 文本 → 候选列表。**纯函数**（只做解析与字符串处理，无 IO），便于单测。
+     *
+     * - master：每个变体一条，按「带宽降序、同带宽按高度降序」排（最清晰在前），
+     *   与 [com.videosniffer.download.hls.M3U8Downloader] 自己选变体的口径一致；
+     * - media：单条，清晰度按 URL 路径兜底推断。
+     *
+     * 一个清晰度都标不出来时**不做展开**：多行一模一样的「原画」只会让人选错，
+     * 此时给出最清晰的那条即可（下载内容与整片下载完全一致）。
+     */
+    fun candidatesForPlaylist(
+        text: String,
+        playlistUrl: String,
+        title: String?,
+        sourcePageUrl: String
+    ): List<DetectedMedia> = when (val parsed = M3U8Parser.parse(text, playlistUrl)) {
+        is HlsPlaylist.Master -> {
+            val expanded = parsed.variants
+                .distinctBy { it.uri }
+                .sortedWith(
+                    compareByDescending<HlsVariant> { it.bandwidth }
+                        .thenByDescending { heightOfResolution(it.resolution) }
+                )
+                .map { variant ->
+                    DetectedMedia(
+                        url = variant.uri,
+                        quality = qualityForResolution(variant.resolution)
+                            ?: qualityFromUrlPath(variant.uri),
+                        size = null,
+                        ext = "m3u8",
+                        title = title,
+                        sourcePageUrl = sourcePageUrl
+                    )
+                }
+            when {
+                expanded.size <= 1 -> expanded
+                expanded.all { it.quality == null } -> listOf(expanded.first())
+                else -> expanded
+            }
+        }
+
+        is HlsPlaylist.Media -> listOf(
+            DetectedMedia(
+                url = playlistUrl,
+                quality = qualityFromUrlPath(playlistUrl),
+                size = null,
+                ext = "m3u8",
+                title = title,
+                sourcePageUrl = sourcePageUrl
+            )
+        )
+
+        null -> emptyList()
+    }
+
+    /** 拉取 playlist 文本；请求失败、响应为空或不含 `#EXTM3U`（不是 playlist）时返回 null */
+    private fun fetchPlaylistText(url: String): String? = try {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", SnifferHttp.UA)
+            .build()
+        SnifferHttp.client.newCall(request).execute().use { resp ->
+            val body = if (resp.isSuccessful) resp.body?.string().orEmpty() else ""
+            body.takeIf { it.contains("#EXTM3U") }
+        }
+    } catch (_: Exception) {
+        null
     }
 }

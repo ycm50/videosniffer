@@ -61,4 +61,100 @@ class MediaUrlDetectorTest {
         assertNull(Hanime1DownloadParser.qualityFromUrl("https://a/name.mp4"))
         assertNull(Hanime1DownloadParser.qualityFromUrl(""))
     }
+
+    @Test
+    fun `master playlist 的 RESOLUTION 映射成清晰度`() {
+        assertEquals("1080p", MediaUrlDetector.qualityForResolution("1920x1080"))
+        assertEquals("720p", MediaUrlDetector.qualityForResolution("1280x720"))
+        assertEquals("2160p", MediaUrlDetector.qualityForResolution("3840x2160"))
+        assertEquals(1080, MediaUrlDetector.heightOfResolution("1920x1080"))
+        assertEquals(0, MediaUrlDetector.heightOfResolution(null))
+        assertNull(MediaUrlDetector.qualityForResolution(null))
+        assertNull(MediaUrlDetector.qualityForResolution(""))
+    }
+
+    @Test
+    fun `URL 路径兜底识别清晰度`() {
+        assertEquals("1080p", MediaUrlDetector.qualityFromUrlPath("https://cdn/hls/1080p/index.m3u8"))
+        assertEquals("720p", MediaUrlDetector.qualityFromUrlPath("https://cdn/720p/seg1.ts?t=1"))
+        assertEquals("1080p", MediaUrlDetector.qualityFromUrlPath("https://cdn/1920x1080/index.m3u8"))
+        assertEquals("1080p", MediaUrlDetector.qualityFromUrlPath("https://cdn/xxx-1080p.mp4"))
+        // 查询串里的数字不算（否则会把签名参数当成清晰度）
+        assertNull(MediaUrlDetector.qualityFromUrlPath("https://cdn/v/index.m3u8?h=1080p"))
+        // URL 里的 token 常长成 `1234p` 这样，不在常见高度白名单里，不认
+        assertNull(MediaUrlDetector.qualityFromUrlPath("https://cdn/a1234p/x.m3u8"))
+        assertNull(MediaUrlDetector.qualityFromUrlPath("https://cdn/video/index.m3u8"))
+    }
+
+    /** 「m3u8 清晰度识别无效」的核心回归：master playlist 必须展开成多个带清晰度的候选 */
+    @Test
+    fun `master playlist 展开成多个清晰度候选_最清晰在前`() {
+        val master = """
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+            low/index.m3u8
+            #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+            high/index.m3u8
+            #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+            mid/index.m3u8
+        """.trimIndent()
+
+        val list = MediaUrlDetector.candidatesForPlaylist(
+            master, "https://cdn/hls/master.m3u8", "作品名", "https://page/watch"
+        )
+
+        assertEquals(listOf("1080p", "720p", "360p"), list.map { it.quality })
+        assertEquals("https://cdn/hls/high/index.m3u8", list[0].url)
+        assertEquals("https://cdn/hls/low/index.m3u8", list[2].url)
+        assertEquals("m3u8", list[0].ext)
+        assertEquals("作品名", list[0].title)
+        assertEquals("https://page/watch", list[0].sourcePageUrl)
+        assertNull("HLS 候选的大小未知", list[0].size)
+    }
+
+    @Test
+    fun `media playlist 只给一条候选_清晰度按路径兜底`() {
+        val media = """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:10
+            #EXTINF:10.0,
+            seg1.ts
+            #EXTINF:10.0,
+            seg2.ts
+        """.trimIndent()
+
+        val list = MediaUrlDetector.candidatesForPlaylist(
+            media, "https://cdn/hls/720p/index.m3u8", "作品名", "https://page/watch"
+        )
+
+        assertEquals(1, list.size)
+        assertEquals("https://cdn/hls/720p/index.m3u8", list[0].url)
+        assertEquals("720p", list[0].quality)
+    }
+
+    @Test
+    fun `标不出清晰度时 master 不展开_只给最清晰的一条`() {
+        val master = """
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=5000000
+            high/index.m3u8
+            #EXT-X-STREAM-INF:BANDWIDTH=800000
+            low/index.m3u8
+        """.trimIndent()
+
+        val list = MediaUrlDetector.candidatesForPlaylist(
+            master, "https://cdn/hls/master.m3u8", null, "https://page/watch"
+        )
+
+        assertEquals("多行一样的「原画」没有意义，只留最清晰的一条", 1, list.size)
+        assertEquals("https://cdn/hls/high/index.m3u8", list[0].url)
+    }
+
+    @Test
+    fun `非 playlist 文本不产生候选`() {
+        assertEquals(
+            emptyList<DetectedMedia>(),
+            MediaUrlDetector.candidatesForPlaylist("<html>not a playlist</html>", "https://a/x", null, "https://p")
+        )
+    }
 }

@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import com.videosniffer.MainActivity
 import com.videosniffer.R
 import com.videosniffer.download.DownloadManager
+import com.videosniffer.download.DownloadProgress
 import com.videosniffer.download.DownloadState
 import com.videosniffer.download.DownloadTask
 import kotlinx.coroutines.CoroutineScope
@@ -88,10 +89,12 @@ class DownloadService : Service() {
 
     private fun updateNotification(task: DownloadTask) {
         val waiting = task.state == DownloadState.QUEUED || task.state == DownloadState.PENDING
-        val pct = if (task.totalBytes > 0 && !waiting) {
-            ((task.downloadedBytes * 100L) / task.totalBytes).toInt().coerceIn(0, 100)
+        // 进度一律走 DownloadProgress（单位是字节；m3u8 的总量是估算值，下载中不显示 100%），
+        // 不要在这里另写一份百分比公式 —— 两个入口各算一套迟早会不一致
+        val pct = if (waiting) {
+            DownloadProgress.UNKNOWN
         } else {
-            -1
+            DownloadProgress.displayPercent(task)
         }
         val text = when {
             waiting -> getString(R.string.notification_queued, task.title)

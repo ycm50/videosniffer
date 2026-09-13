@@ -153,7 +153,11 @@
 **辅通道 —— 请求级拦截（Route A，兜底）**
 - `shouldInterceptRequest` / `onLoadStarted` 收集所有请求 URL
 - 后台 HEAD 验证扩展名 + Content-Type + Content-Length，识别 mp4/m3u8
-- 对 m3u8 额外解析：确认是有效 playlist（时长>0）
+- 对 m3u8 额外解析：一次 GET 取 playlist 文本，确认是有效 playlist（含 `#EXTM3U`），
+  并直接据此产出候选 —— **master playlist 会展开成多个候选**（每个 `#EXT-X-STREAM-INF` 变体一条，
+  清晰度取 `RESOLUTION`，如 `1080p`；排序与下载器选变体的口径一致：带宽降序、同带宽按高度降序），
+  media playlist 则单条候选、清晰度按 URL 路径兜底（很多 CDN 把清晰度写进目录名）。
+  一个清晰度都标不出来时**不展开**，只给最清晰的一条 —— 多行一模一样的「原画」只会让人选错
 
 **触发**：命中任一路径且视频在播放 → 显示下载按钮。
 
@@ -271,7 +275,12 @@ fMP4: #EXT-X-MAP 初始化段作为第 0 个分片参与拼接
   并发数会静默退化成 1）
 - 分片级并发：每个任务内部按 `threadCount`（1~32）用 `Semaphore` 限制同时进行的 Range 请求数
 - OkHttp `maxRequestsPerHost` 提升到 64，否则默认 5 会把多线程压成五并发
-- 进度上报：分片只累加共享计数器，独立 ticker 协程每 **300ms** 汇总一次，避免回调竞态
+- 进度上报：分片只累加共享计数器，独立 ticker 协程每 **300ms** 汇总一次，避免回调竞态。
+  **单位固定是字节**：mp4 的 `Content-Length` 就是精确总量；m3u8 的总量是「已落盘字节 / 已落盘时长」
+  实测码率 × playlist 总时长**估算**出来的（`DownloadProgress.estimateTotalBytes`）。
+  HLS 分片是边读边累加字节（不是 `body.bytes()` 一次性读完），所以进度是连续的 ——
+  早期用过「分片计数」，一个大分片下几分钟才动一格，看起来就是「进度条不更新」。
+  百分比一律走 `DownloadProgress`，列表与通知栏共用同一个公式
 - 状态写入用 `_tasks.update { }`（CAS）而非「读 value → map → 写 value」，
   否则 ticker 的进度回调与 `runTask` 的状态迁移并发时会互相覆盖、静默丢失状态更新
 - 前台服务的启停：启动由调度器负责（`startForegroundService`），**停止只由 `DownloadService`
@@ -445,6 +454,8 @@ com/videosniffer/
 | 数据库升级会清空下载记录 | `onUpgrade` 改为增量补列 |
 | 清晰度对话框只显示「清晰度 · 大小 · 格式」，认不出是哪个视频 | 改为「作品名 · 清晰度 · 大小 · 格式」，标题取 watch 页 `<h1>`/`<title>` |
 | 下载候选里混入 0.1~0.7 MB 的广告/预告短 mp4 | 已知大小 < 1 MB 的候选直接过滤，全被过滤时给出提示 |
+| m3u8 进度显示错误（先是一直 100%，改完又变成「进度条不更新」） | **根因一**：引擎上报「已下载字节 / 已知字节」，而「已知字节」只累计**已完成分片**的字节数，分母随分子一起增长 → 百分比从第一次上报起恒为 100%。**根因二**：改成「已完成分片数 / 总分片数」后又太粗 —— 分片普遍好几 MB，`body.bytes()` 一次性读完，中途没有任何可上报的进度，大分片/少分片的源几分钟才动一格。**最终做法**：单位固定为**字节**，分片**边读边累加**（`readFully` + 回调），总量用「已落盘字节 / 已落盘时长 × playlist 总时长」估算并随下载收敛；下载中百分比上限 99%（`displayPercent`，估算分母偏小时不误报完成），全部落盘后引擎强制上报真实总大小收尾到 100%。公式与口径集中在 `DownloadProgress`，`DownloadProgressTest` 钉住 |
+| m3u8 清晰度识别无效（HLS 候选在对话框里一律是「原画」） | **根因**：`MediaUrlDetector.detect` 对非 YouTube 的候选**硬编码 `quality = null`**，master playlist 里的 1080p/720p/480p 全被丢掉。修复：新增 `detectAll()`，一次 GET 取 playlist 文本交给 `M3U8Parser` 解析 —— **master 展开成多个候选**（清晰度取 `RESOLUTION`）、media playlist 与普通直链按 URL 路径兜底识别；对话框默认选中项改为「按清晰度高度取最高」（旧实现写死「取最后一条」，对最清晰在前的列表会默认选中最低画质）；hanime1 解析器不再用 null 覆盖已识别到的清晰度 |
 
 ---
 

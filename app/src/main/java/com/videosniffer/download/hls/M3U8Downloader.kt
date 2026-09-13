@@ -3,6 +3,7 @@ package com.videosniffer.download.hls
 import android.content.Context
 import android.os.Environment
 import com.videosniffer.download.DownloadOutcome
+import com.videosniffer.download.DownloadProgress
 import com.videosniffer.download.DownloadTask
 import com.videosniffer.download.Stopped
 import com.videosniffer.sniff.SnifferHttp
@@ -15,6 +16,8 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Request
+import okhttp3.ResponseBody
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -32,7 +35,9 @@ import java.util.concurrent.atomic.AtomicLong
  * 2. **fMP4 / `#EXT-X-MAP`**：把初始化段作为第 0 个分片参与拼接，支持 fMP4 流。
  * 3. **不抛异常**：失败以 [DownloadOutcome.Failed] 返回，避免被误判为用户取消而删档。
  * 4. **单分片重试**：网络抖动按退避重试，不再因一个分片失败就整体作废。
- * 5. **进度按字节**：优先使用分片实际字节数，未知时退化为分片计数。
+ * 5. **进度按字节连续上报**：边读边累加字节（不再 `body.bytes()` 一次性读完），总量用
+ *    「已落盘字节 / 已落盘时长」实测码率 × playlist 总时长估算（见 [DownloadProgress]）。
+ *    早年用过「分片计数」，粒度太粗 —— 一个大分片要下几分钟，进度条一直不动。
  */
 object M3U8Downloader {
 
@@ -40,6 +45,9 @@ object M3U8Downloader {
     private const val MAX_SEGMENT_ATTEMPTS = 3
     private const val RETRY_BACKOFF_MS = 800L
     private const val COPY_BUFFER = 256 * 1024
+
+    /** 预分配缓冲区上限：源给的 Content-Length 不可全信，超过这个值就不按它预分配 */
+    private const val MAX_PREFETCH_BYTES = 64L * 1024 * 1024
 
     suspend fun download(
         context: Context,
@@ -72,10 +80,12 @@ object M3U8Downloader {
         val workDir = File(tmpDir, task.id)
         workDir.mkdirs()
 
-        val total = jobs.size.toLong()
-        val knownBytes = AtomicLong(0)
-        val doneBytes = AtomicLong(0)
-        val doneJobs = AtomicInteger(0)
+        // 累计已读字节（含**正在下载**的分片，所以进度是连续的，而不是「下完一个分片跳一格」）
+        val downloadedBytes = AtomicLong(0)
+        // 已落盘字节 + 这些分片的播放时长：用来算实测码率，进而估算总字节数
+        val writtenBytes = AtomicLong(0)
+        val writtenDurationMs = AtomicLong(0)
+        val totalDurationMs = jobs.sumOf { it.durationMs }
 
         val semaphore = Semaphore(task.threadCount.coerceAtLeast(1))
         val activeConn = AtomicInteger(0)
@@ -86,14 +96,17 @@ object M3U8Downloader {
             val ticker = launch(Dispatchers.IO) {
                 while (isActive) {
                     task.activeConnections = activeConn.get()
-                    val totalBytes = knownBytes.get()
-                    if (totalBytes > 0) {
-                        // 已获知字节数：按字节上报，进度比按分片计数平滑
-                        onProgress(doneBytes.get(), totalBytes)
-                    } else {
-                        // 字节数未知（源未给 Content-Length）：退化为分片计数
-                        onProgress(doneJobs.get().toLong(), total)
-                    }
+                    // 进度单位是**字节**：分子是真实已读字节，分母是按实测码率估算的总字节数。
+                    // 采样不足（或 playlist 没有时长信息）时总量为 0 → UI 走不确定动画，
+                    // 绝不显示假的 100%（那正是最早的 bug）。
+                    onProgress(
+                        downloadedBytes.get(),
+                        DownloadProgress.estimateTotalBytes(
+                            writtenBytes.get(),
+                            writtenDurationMs.get(),
+                            totalDurationMs
+                        )
+                    )
                     delay(PROGRESS_TICK_MS)
                 }
             }
@@ -108,9 +121,11 @@ object M3U8Downloader {
                                 val target = File(workDir, job.fileName)
                                 // 断点续传：已存在的完整分片直接复用（内容已解密）
                                 if (target.exists() && target.length() > 0) {
-                                    knownBytes.addAndGet(target.length())
-                                    doneBytes.addAndGet(target.length())
-                                    doneJobs.incrementAndGet()
+                                    val length = target.length()
+                                    writtenBytes.addAndGet(length)
+                                    // 也计入「已读」：续传任务的进度条从上次的位置接着走，不从 0 开始
+                                    downloadedBytes.addAndGet(length)
+                                    writtenDurationMs.addAndGet(job.durationMs)
                                     return@withPermit
                                 }
 
@@ -122,12 +137,15 @@ object M3U8Downloader {
                                     if (attempt > 1) delay(RETRY_BACKOFF_MS * (attempt - 1))
                                     activeConn.incrementAndGet()
                                     try {
-                                        val result = fetchAndPrepare(job, keyCache)
+                                        // 边读边把字节数累加到进度计数器上：分片往往有好几 MB，
+                                        // 等下完再报就是「一格一格跳」，大分片时看起来像卡住不动
+                                        val result = fetchAndPrepare(job, keyCache) { read ->
+                                            downloadedBytes.addAndGet(read)
+                                        }
                                         writeAtomically(target, result)
                                         // result.size 是 Int，AtomicLong.addAndGet 需要 Long
-                                        knownBytes.addAndGet(result.size.toLong())
-                                        doneBytes.addAndGet(result.size.toLong())
-                                        doneJobs.incrementAndGet()
+                                        writtenBytes.addAndGet(result.size.toLong())
+                                        writtenDurationMs.addAndGet(job.durationMs)
                                         lastError = null
                                         break
                                     } catch (e: Exception) {
@@ -158,9 +176,11 @@ object M3U8Downloader {
             return@withContext DownloadOutcome.Failed("分片缺失")
         }
 
-        val totalKnown = knownBytes.get()
-        if (totalKnown <= 0) return@withContext DownloadOutcome.Failed("分片为空")
-        onProgress(totalKnown, totalKnown)
+        val totalWritten = writtenBytes.get()
+        if (totalWritten <= 0) return@withContext DownloadOutcome.Failed("分片为空")
+        // 全部分片落盘：直接上报真实总大小 → 进度精确收尾到 100%
+        //（估算分母偏小/偏大都靠这一步兜住，配合 DownloadProgress.displayPercent 的 99% 上限）
+        onProgress(totalWritten, totalWritten)
 
         val outFile = File(tmpDir, task.id + ".mp4")
         try {
@@ -210,7 +230,9 @@ object M3U8Downloader {
         val uri: String,
         val key: HlsKey,
         val ivSeed: Long,
-        val byteRange: ByteRange?
+        val byteRange: ByteRange?,
+        /** 分片时长（毫秒）。init 段为 0；用于把「已下载字节」换算成整片进度 */
+        val durationMs: Long
     )
 
     /**
@@ -236,7 +258,9 @@ object M3U8Downloader {
                         // init 段本身不加密（RFC 8216：MAP 不参与 EXT-X-KEY 加密）
                         key = HlsKey.NONE,
                         ivSeed = 0L,
-                        byteRange = map.byteRange
+                        byteRange = map.byteRange,
+                        // init 段没有播出时长，不计入进度换算的时长口径
+                        durationMs = 0L
                     )
                 )
                 initIndex++
@@ -250,7 +274,8 @@ object M3U8Downloader {
                     uri = segment.uri,
                     key = segment.key,
                     ivSeed = playlist.mediaSequence + segmentIndex,
-                    byteRange = segment.byteRange
+                    byteRange = segment.byteRange,
+                    durationMs = (segment.durationSec * 1000.0).toLong().coerceAtLeast(0L)
                 )
             )
         }
@@ -262,13 +287,19 @@ object M3U8Downloader {
     /**
      * 拉取分片原始数据并解密，返回可直接落盘的字节。
      * 任何失败都抛异常（由调用方重试并汇总）。
+     *
+     * @param onBytesRead 每读到一段就回调其长度；进度条靠它连续推进（见 [download] 里的 ticker）
      */
-    private suspend fun fetchAndPrepare(job: Job, keyCache: MutableMap<String, ByteArray>): ByteArray {
+    private suspend fun fetchAndPrepare(
+        job: Job,
+        keyCache: MutableMap<String, ByteArray>,
+        onBytesRead: (Long) -> Unit
+    ): ByteArray {
         val request = buildRequest(job)
         val raw = SnifferHttp.client.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             val body = resp.body ?: throw IOException("响应为空")
-            body.bytes()
+            readFully(body, onBytesRead)
         }
         if (raw.isEmpty()) throw IOException("分片为空")
 
@@ -304,6 +335,30 @@ object M3U8Downloader {
             if (bytes.size != 16) throw IOException("密钥长度异常(${bytes.size})")
             bytes
         }
+    }
+
+    /**
+     * 读完整段响应体，并**边读边回报**已读字节数。
+     *
+     * 这里刻意不用 `body.bytes()`：它一次性读完，中途没有任何进度可报。
+     * 分片普遍有好几 MB，下完才动一格 → 分片大/分片少的源看上去就是「进度条不更新」。
+     */
+    private fun readFully(body: ResponseBody, onBytesRead: (Long) -> Unit): ByteArray {
+        val declared = body.contentLength()
+        val buffer = ByteArray(COPY_BUFFER)
+        // Content-Length 只用来预分配（不可全信，故设上限）
+        val out = ByteArrayOutputStream(
+            if (declared in 1L..MAX_PREFETCH_BYTES) declared.toInt() else COPY_BUFFER
+        )
+        body.byteStream().use { input ->
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                out.write(buffer, 0, read)
+                onBytesRead(read.toLong())
+            }
+        }
+        return out.toByteArray()
     }
 
     /** 先写 .tmp 再原子改名，避免中断留下半截文件被当作「已完成」。 */

@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -188,10 +187,12 @@ class BrowserViewModel : ViewModel() {
         }
     }
 
-    /** 注意是 suspend：内部调用的 MediaUrlDetector.detect 会发起 HEAD 请求 */
+    /** 注意是 suspend：内部调用的 MediaUrlDetector.detectAll 会发起 HEAD/GET 请求 */
     private suspend fun doProbe(url: String, sourcePageUrl: String, title: String?) {
-        val media = MediaUrlDetector.detect(url, sourcePageUrl, title) ?: return
-        addMedia(listOf(media))
+        // 可能不止一条：HLS master playlist 会展开成多个清晰度候选（1080p/720p/480p…）
+        val media = MediaUrlDetector.detectAll(url, sourcePageUrl, title)
+        if (media.isEmpty()) return
+        addMedia(media)
         notifyIfAllFiltered()
     }
 
@@ -204,18 +205,47 @@ class BrowserViewModel : ViewModel() {
     /**
      * 过滤 + 按 URL 去重合并，新资源追加。
      *
-     * [_mediaList] 是 CAS 写入的 StateFlow，本方法会同时被多个 probe 协程调用，
-     * 因此整体加锁，保证「过滤-去重-追加」三步不会互相覆盖。
+     * [_mediaList] 会被多个 probe 协程并发写入，因此整体加锁，保证「过滤-合并-追加」
+     * 三步不会互相覆盖（读改写而非 `update{}`：CAS 重试会让去重与变更判定被重复执行）。
+     *
+     * 同一 URL 已经存在时**只升级信息**（补上清晰度/大小/标题），不重复追加。
+     * 这个分支不是理论情况：播放器通常先请求单码率 playlist / 分片、再请求 master，
+     * 两者会落在同一批 probe 里并发校验 —— 谁先完成不确定。
+     * 若不做升级，master 展开出来的「1080p/720p/480p」里会有一条退化成「原画」。
      */
     private fun addMedia(incoming: List<DetectedMedia>) {
         val fresh = incoming.filter { it.isUsable() }
         val rejected = incoming.size - fresh.size
         if (rejected > 0) rejectedThisPage.addAndGet(rejected)
+        if (fresh.isEmpty()) return
 
         synchronized(observedUrls) {
-            val added = fresh.filter { acceptedUrls.add(it.url) }
-            if (added.isEmpty()) return
-            _mediaList.update { it + added }
+            val merged = _mediaList.value.toMutableList()
+            var changed = false
+
+            fresh.forEach { media ->
+                val index = merged.indexOfFirst { it.url == media.url }
+                if (index < 0) {
+                    acceptedUrls.add(media.url)
+                    merged.add(media)
+                    changed = true
+                } else {
+                    // 不用 null 覆盖已有信息（例如先到的那条没有清晰度）
+                    val old = merged[index]
+                    val upgraded = old.copy(
+                        quality = old.quality ?: media.quality,
+                        size = old.size ?: media.size,
+                        title = old.title ?: media.title
+                    )
+                    if (upgraded != old) {
+                        merged[index] = upgraded
+                        changed = true
+                    }
+                }
+            }
+            if (!changed) return
+
+            _mediaList.value = merged
             pageAccepted = true
         }
     }

@@ -312,8 +312,9 @@ class BrowserFragment : Fragment(R.layout.fragment_browser) {
             val size = media.size?.let { formatSize(it) } ?: getString(R.string.size_unknown)
             getString(R.string.dialog_quality_item, name, q, size, media.ext)
         }.toTypedArray()
-        var selected = list.indices.last
-        list.indexOfFirst { it.quality == "1080p" }.takeIf { it >= 0 }?.let { selected = it }
+        // 默认选中清晰度最高的一条。旧实现写死「取列表最后一条，若是 1080p 则选它」，
+        // 对「最清晰在最前」的列表（HLS 变体就是这样排的）会默认选中最低画质。
+        var selected = DetectedMedia.bestIndex(list)
 
         AlertDialog.Builder(requireContext())
             .setTitle(R.string.dialog_quality_title)

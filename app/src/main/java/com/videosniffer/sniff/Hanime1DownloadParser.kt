@@ -109,7 +109,9 @@ object Hanime1DownloadParser : PageParser {
 
                     val media = MediaUrlDetector.detect(href, referer, name)
                         ?: return@mapNotNull null
-                    media.copy(quality = quality)
+                    // 文件名里没带清晰度时（例如链接是 m3u8），保留嗅探到的清晰度，
+                    // 不能用 null 覆盖 —— 否则 HLS 变体识别出来的清晰度会被抹掉
+                    media.copy(quality = quality ?: media.quality)
                 }.distinctBy { it.url }
             }
         } catch (_: Exception) {
