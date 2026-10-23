@@ -48,6 +48,8 @@ class DownloadDbHelper(context: Context) :
             )
             """.trimIndent()
         )
+        // 分片表按 task_id 查询，没有索引时每次续传都要全表扫描
+        db.execSQL(CREATE_SHARD_INDEX)
     }
 
     /**
@@ -71,6 +73,9 @@ class DownloadDbHelper(context: Context) :
         addColumnIfMissing(db, T_TASKS, taskColumns, "error", "TEXT")
         addColumnIfMissing(db, T_TASKS, taskColumns, "created_at", "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing(db, T_SHARDS, shardColumns, "finished", "INTEGER NOT NULL DEFAULT 0")
+
+        // v2：补索引（老库升级上来时同样需要）
+        runCatching { db.execSQL(CREATE_SHARD_INDEX) }
     }
 
     private fun existingColumns(db: SQLiteDatabase, table: String): Set<String> {
@@ -129,20 +134,33 @@ class DownloadDbHelper(context: Context) :
 
     // ---------- shards ----------
 
+    /**
+     * 整体替换某任务的分片表。
+     *
+     * 必须在一个事务里：先 delete 再逐条 insert，若不包事务，中途异常会留下一张
+     * 被删了一半的分片表 —— 续传时区间缺失，下载出来的文件是坏的。
+     * 事务同时把 N 次提交合并成 1 次，分片多时（32 线程）写库明显更快。
+     */
     fun saveShards(taskId: String, shards: List<Shard>) {
         val db = writableDatabase
-        db.delete(T_SHARDS, "task_id=?", arrayOf(taskId))
-        shards.forEach { shard ->
-            db.insert(
-                T_SHARDS, null,
-                ContentValues().apply {
-                    put("task_id", taskId)
-                    put("idx", shard.index)
-                    put("start", shard.start)
-                    put("end", shard.end)
-                    put("finished", shard.finished)
-                }
-            )
+        db.beginTransaction()
+        try {
+            db.delete(T_SHARDS, "task_id=?", arrayOf(taskId))
+            shards.forEach { shard ->
+                db.insert(
+                    T_SHARDS, null,
+                    ContentValues().apply {
+                        put("task_id", taskId)
+                        put("idx", shard.index)
+                        put("start", shard.start)
+                        put("end", shard.end)
+                        put("finished", shard.finished)
+                    }
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
     }
 
@@ -216,8 +234,14 @@ class DownloadDbHelper(context: Context) :
 
     companion object {
         private const val DB_NAME = "hanime1.db"
-        private const val DB_VERSION = 1
+
+        /** v2：给 shards(task_id) 补索引（v1 的库通过 onUpgrade 增量补齐） */
+        private const val DB_VERSION = 2
         private const val T_TASKS = "tasks"
         private const val T_SHARDS = "shards"
+
+        /** 幂等：重复执行不会报错，onCreate 与 onUpgrade 共用。 */
+        private const val CREATE_SHARD_INDEX =
+            "CREATE INDEX IF NOT EXISTS idx_shards_task ON $T_SHARDS(task_id)"
     }
 }

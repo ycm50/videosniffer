@@ -43,6 +43,27 @@ object HlsCrypto {
     }
 
     /**
+     * 流式解密：边读边解，不把整个分片读进内存。
+     *
+     * CBC 是分组模式，`CipherInputStream` 逐块输出、末尾处理填充，因此可以直接接到
+     * `FileOutputStream` 上。这样峰值内存从「2 × 分片大小 × 并发数」降到常量缓冲区 ——
+     * 8 线程 × 10 MB 分片原本要 160 MB+，低内存机型会直接 OOM。
+     *
+     * 填充错误会在流末尾以 `IOException` 抛出（由调用方按分片失败重试）。
+     */
+    fun decryptStream(input: java.io.InputStream, key: ByteArray, iv: ByteArray): java.io.InputStream {
+        require(key.size == 16) { "AES-128 密钥必须为 16 字节，实际 ${key.size}" }
+        require(iv.size == 16) { "IV 必须为 16 字节，实际 ${iv.size}" }
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(key, "AES"),
+            IvParameterSpec(iv)
+        )
+        return javax.crypto.CipherInputStream(input, cipher)
+    }
+
+    /**
      * 解析 `#EXT-X-KEY:IV=0x...` 的十六进制 IV。
      * 长度不足 16 字节时左侧补零（RFC 8216 允许省略前导零）。
      *

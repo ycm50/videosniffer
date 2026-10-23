@@ -11,6 +11,8 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.isVisible
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.videosniffer.R
 import com.videosniffer.download.DownloadManager
@@ -21,26 +23,19 @@ import com.videosniffer.download.DownloadTask
 /**
  * 下载任务列表适配器。
  *
- * 列表由 [DownloadListFragment] 订阅 [DownloadManager.tasks] 驱动（每 300ms 一次进度），
- * 因此：[notifyDataSetChanged] 会重绘可见项，速度按「最近一次采样」计算以保证平滑。
+ * 用 [ListAdapter] + [DiffUtil] 而不是 `notifyDataSetChanged()`：
+ * 进度每 300ms 上报一次，全量重绑会把所有可见项（含按钮、进度条、文本）重建一遍，
+ * 滑动时明显掉帧；diff 之后只有真正变化的项会重绑。
+ *
+ * 速度按「最近一次采样」计算以保证平滑（详见 [speedFor]）。
  */
-class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
-
-    private val items = mutableListOf<DownloadTask>()
+class DownloadAdapter : ListAdapter<DownloadTask, DownloadAdapter.VH>(DIFF) {
 
     /** id -> (已下载字节, 采样时刻)，用于计算实时速度 */
     private val lastSample = HashMap<String, Pair<Long, Long>>()
 
     /** id -> 最近一次成功计算出的速度文本（采样过密时沿用，避免读数抖动） */
     private val lastSpeed = HashMap<String, String>()
-
-    fun submitList(list: List<DownloadTask>) {
-        items.clear()
-        items.addAll(list)
-        notifyDataSetChanged()
-    }
-
-    override fun getItemCount(): Int = items.size
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val view = LayoutInflater.from(parent.context)
@@ -49,7 +44,7 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) {
-        holder.bind(items[position])
+        holder.bind(getItem(position))
     }
 
     inner class VH(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -121,8 +116,10 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
             val baseMeta = ctx.getString(R.string.meta_download, quality, sizeText, speedSuffix)
             tvMeta.text = "$baseMeta$connSuffix"
 
-            // 失败原因（旧版从不展示，导致用户无从判断）
-            tvError.isVisible = task.state == DownloadState.FAILED && !task.error.isNullOrBlank()
+            // 失败原因（旧版从不展示，导致用户无从判断）。
+            // 暂停也要展示：断网自动暂停会写一条原因，否则用户只看到「已暂停」不知道为何。
+            tvError.isVisible = (task.state == DownloadState.FAILED ||
+                task.state == DownloadState.PAUSED) && !task.error.isNullOrBlank()
             tvError.text = task.error?.let { ctx.getString(R.string.format_error, it) }.orEmpty()
 
             // 暂停/继续
@@ -245,5 +242,19 @@ class DownloadAdapter : RecyclerView.Adapter<DownloadAdapter.VH>() {
     private companion object {
         /** 同一任务两次速度采样之间的最小间隔 */
         const val MIN_SAMPLE_INTERVAL_MS = 300L
+
+        /**
+         * diff 规则：`id` 决定「是不是同一项」，全字段相等决定「内容是否变了」。
+         *
+         * [DownloadTask] 是 data class，`equals` 覆盖进度 / 状态 / 连接数 / 错误信息，
+         * 正好就是列表要显示的字段 —— 因此内容没变的项不会被重绑。
+         */
+        val DIFF = object : DiffUtil.ItemCallback<DownloadTask>() {
+            override fun areItemsTheSame(oldItem: DownloadTask, newItem: DownloadTask): Boolean =
+                oldItem.id == newItem.id
+
+            override fun areContentsTheSame(oldItem: DownloadTask, newItem: DownloadTask): Boolean =
+                oldItem == newItem
+        }
     }
 }

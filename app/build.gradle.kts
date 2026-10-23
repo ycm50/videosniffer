@@ -14,9 +14,11 @@ android {
         applicationId = "com.videosniffer"
         minSdk = 29
         targetSdk = 36
-        // 版本号由 CI 传入（-PVERSION_NAME / -PVERSION_CODE），本地默认 1.0 / 1
-        versionCode = (project.findProperty("VERSION_CODE")?.toString() ?: "1").toInt()
-        versionName = project.findProperty("VERSION_NAME")?.toString() ?: "1.0"
+        // 版本号由 CI 传入（-PVERSION_NAME / -PVERSION_CODE），本地默认 1.0 / 1。
+        // 用 providers.gradleProperty 而不是 findProperty：前者是可追踪的 Provider，
+        // 配置缓存（configuration cache）才能把这个输入纳入指纹。
+        versionCode = project.providers.gradleProperty("VERSION_CODE").orNull?.toIntOrNull() ?: 1
+        versionName = project.providers.gradleProperty("VERSION_NAME").orNull ?: "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

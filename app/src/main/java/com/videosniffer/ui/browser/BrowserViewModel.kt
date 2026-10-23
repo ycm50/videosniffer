@@ -52,6 +52,15 @@ class BrowserViewModel : ViewModel() {
     /** 已加入列表的 URL */
     private val acceptedUrls: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
+    /**
+     * url -> 在 [_mediaList] 中的下标。
+     *
+     * 之前每条候选都要 `merged.indexOfFirst { it.url == ... }` 全表扫一遍，
+     * HLS master 展开后候选数上百，去重就成了 O(n²)。用索引表降到 O(1)。
+     * 只在「追加」与「原地升级」时维护，列表整体替换时索引不变。
+     */
+    private val mediaIndex: MutableMap<String, Int> = HashMap()
+
     /** Route A 校验并发上限 */
     private val probeSemaphore = Semaphore(MAX_CONCURRENT_PROBES)
 
@@ -133,6 +142,7 @@ class BrowserViewModel : ViewModel() {
         synchronized(observedUrls) {
             observedUrls.clear()
             acceptedUrls.clear()
+            mediaIndex.clear()
             pendingUrls.clear()
         }
         flushJob?.cancel()
@@ -224,9 +234,10 @@ class BrowserViewModel : ViewModel() {
             var changed = false
 
             fresh.forEach { media ->
-                val index = merged.indexOfFirst { it.url == media.url }
-                if (index < 0) {
+                val index = mediaIndex[media.url]
+                if (index == null) {
                     acceptedUrls.add(media.url)
+                    mediaIndex[media.url] = merged.size
                     merged.add(media)
                     changed = true
                 } else {

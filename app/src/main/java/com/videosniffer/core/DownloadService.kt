@@ -48,13 +48,13 @@ class DownloadService : Service() {
         scope.launch {
             DownloadManager.tasks.collectLatest { tasks ->
                 // 排队中也要保持前台服务（否则等待补位的任务会被系统回收）
-                val active = tasks.firstOrNull {
+                val active = tasks.filter {
                     it.state in setOf(
                         DownloadState.QUEUED, DownloadState.PENDING, DownloadState.PROBING,
                         DownloadState.DOWNLOADING, DownloadState.EXPORTING
                     )
                 }
-                if (active == null) {
+                if (active.isEmpty()) {
                     // 无存活任务（含无任务）时由本收集器统一停服，
                     // 不再由调度器并发判断，避免把刚启动的服务杀掉
                     stopSelf()
@@ -87,23 +87,54 @@ class DownloadService : Service() {
         }
     }
 
-    private fun updateNotification(task: DownloadTask) {
-        val waiting = task.state == DownloadState.QUEUED || task.state == DownloadState.PENDING
-        // 进度一律走 DownloadProgress（单位是字节；m3u8 的总量是估算值，下载中不显示 100%），
-        // 不要在这里另写一份百分比公式 —— 两个入口各算一套迟早会不一致
-        val pct = if (waiting) {
-            DownloadProgress.UNKNOWN
+    /**
+     * 更新前台通知。
+     *
+     * 单个任务：显示标题与百分比（进度一律走 [DownloadProgress]，不要在这里另写公式）。
+     * 多个任务：显示聚合进度 —— 此前只取 `firstOrNull`，同时下 3 个任务时通知栏只反映
+     * 其中一个，用户看不到整体还剩多少。
+     */
+    private fun updateNotification(active: List<DownloadTask>) {
+        val text: String
+        val pct: Int
+
+        if (active.size == 1) {
+            val task = active.first()
+            val waiting = task.state == DownloadState.QUEUED || task.state == DownloadState.PENDING
+            pct = if (waiting) {
+                DownloadProgress.UNKNOWN
+            } else {
+                DownloadProgress.displayPercent(task)
+            }
+            text = when {
+                waiting -> getString(R.string.notification_queued, task.title)
+                task.state == DownloadState.EXPORTING ->
+                    getString(R.string.notification_exporting, task.title)
+                else -> getString(
+                    R.string.notification_downloading, task.title, if (pct >= 0) "$pct%" else ""
+                )
+            }
         } else {
-            DownloadProgress.displayPercent(task)
+            // 聚合口径：只有当每个任务的总量都已知时才算百分比，否则走不确定动画，
+            // 绝不显示一个「看着像 100% 其实是猜的」数字。
+            val allKnown = active.all { it.totalBytes > 0 }
+            pct = if (allKnown) {
+                val total = DownloadProgress.percent(
+                    active.sumOf { it.downloadedBytes },
+                    active.sumOf { it.totalBytes }
+                )
+                // 下载中不显示 100%（与 DownloadProgress.displayPercent 的约定一致）
+                if (total == 100) 99 else total
+            } else {
+                DownloadProgress.UNKNOWN
+            }
+            text = if (pct >= 0) {
+                getString(R.string.notification_multi, active.size, pct)
+            } else {
+                getString(R.string.notification_multi_unknown, active.size)
+            }
         }
-        val text = when {
-            waiting -> getString(R.string.notification_queued, task.title)
-            task.state == DownloadState.EXPORTING ->
-                getString(R.string.notification_exporting, task.title)
-            else -> getString(
-                R.string.notification_downloading, task.title, if (pct >= 0) "$pct%" else ""
-            )
-        }
+
         // 进度每 300ms 上报一次，但百分比通常一两秒才变一格。
         // 内容没变就跳过：否则会在主线程上每秒重建三次通知（startForeground 有实际开销）。
         if (text == lastNotificationText && pct == lastNotificationProgress) return

@@ -190,7 +190,9 @@ class M3U8ParserTest {
         assertEquals("https://cdn.example.com/root.ts", M3U8Parser.resolve(base, "/root.ts"))
         assertEquals("https://cdn.example.com/hls/v1/seg.ts", M3U8Parser.resolve(base, "seg.ts"))
         assertEquals("https://cdn.example.com/hls/seg.ts", M3U8Parser.resolve(base, "../seg.ts"))
-        assertEquals("https://cdn.example.com/hls/x.ts", M3U8Parser.resolve(base, "../../x.ts"))
+        // base 路径为 /hls/v1/index.m3u8：上一级到 /hls/，再上一级就到根 —— 按 RFC 3986 应是 /x.ts。
+        // （旧断言写成 /hls/x.ts，是把「两级上跳」当成了一级。）
+        assertEquals("https://cdn.example.com/x.ts", M3U8Parser.resolve(base, "../../x.ts"))
     }
 
     @Test

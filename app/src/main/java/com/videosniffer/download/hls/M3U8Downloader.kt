@@ -16,12 +16,12 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Request
-import okhttp3.ResponseBody
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.FilterInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -38,6 +38,11 @@ import java.util.concurrent.atomic.AtomicLong
  * 5. **进度按字节连续上报**：边读边累加字节（不再 `body.bytes()` 一次性读完），总量用
  *    「已落盘字节 / 已落盘时长」实测码率 × playlist 总时长估算（见 [DownloadProgress]）。
  *    早年用过「分片计数」，粒度太粗 —— 一个大分片要下几分钟，进度条一直不动。
+ * 6. **流式解密落盘**：分片不再整段进内存（见 [fetchSegmentToFile]）。
+ * 7. **请求带 Referer**：防盗链站点的分片/密钥/playlist 都要校验来源页，
+ *    此前只有单文件下载带了 Referer，m3u8 一律 403。
+ * 8. **进度不重复计数**：重试同一分片时按「本次已读的最大值」计，而不是累加，
+ *    否则重试几次后「已下载」会超过视频实际大小。
  */
 object M3U8Downloader {
 
@@ -46,9 +51,6 @@ object M3U8Downloader {
     private const val RETRY_BACKOFF_MS = 800L
     private const val COPY_BUFFER = 256 * 1024
 
-    /** 预分配缓冲区上限：源给的 Content-Length 不可全信，超过这个值就不按它预分配 */
-    private const val MAX_PREFETCH_BYTES = 64L * 1024 * 1024
-
     suspend fun download(
         context: Context,
         task: DownloadTask,
@@ -56,9 +58,10 @@ object M3U8Downloader {
         onProgress: (Long, Long) -> Unit
     ): DownloadOutcome = withContext(Dispatchers.IO) {
         val playlistUrl = task.m3u8Url ?: task.url
+        val referer = task.sourcePageUrl
 
         val mediaPlaylist = try {
-            resolveMediaPlaylist(playlistUrl)
+            resolveMediaPlaylist(playlistUrl, referer)
         } catch (e: Exception) {
             return@withContext DownloadOutcome.Failed("m3u8 解析失败：${e.message ?: e.javaClass.simpleName}")
         } ?: return@withContext DownloadOutcome.Failed("m3u8 无有效分片")
@@ -80,8 +83,20 @@ object M3U8Downloader {
         val workDir = File(tmpDir, task.id)
         workDir.mkdirs()
 
-        // 累计已读字节（含**正在下载**的分片，所以进度是连续的，而不是「下完一个分片跳一格」）
-        val downloadedBytes = AtomicLong(0)
+        /**
+         * 每个分片「本次会话最多读到过多少字节」。
+         *
+         * 用 max 而不是累加：重试会把同一个分片从头再读一遍，累加会让进度虚高
+         * （下完 1 GB 的视频却显示已下载 1.2 GB），也会让估算的百分比提前冲到 99%。
+         */
+        val jobBytes = ConcurrentHashMap<String, AtomicLong>()
+
+        /** 记一个分片的进度：只升不降。 */
+        fun noteJobBytes(fileName: String, bytes: Long) {
+            if (bytes <= 0) return
+            jobBytes.getOrPut(fileName) { AtomicLong(0) }.updateAndGet { maxOf(it, bytes) }
+        }
+
         // 已落盘字节 + 这些分片的播放时长：用来算实测码率，进而估算总字节数
         val writtenBytes = AtomicLong(0)
         val writtenDurationMs = AtomicLong(0)
@@ -100,7 +115,7 @@ object M3U8Downloader {
                     // 采样不足（或 playlist 没有时长信息）时总量为 0 → UI 走不确定动画，
                     // 绝不显示假的 100%（那正是最早的 bug）。
                     onProgress(
-                        downloadedBytes.get(),
+                        jobBytes.values.sumOf { it.get() },
                         DownloadProgress.estimateTotalBytes(
                             writtenBytes.get(),
                             writtenDurationMs.get(),
@@ -124,7 +139,7 @@ object M3U8Downloader {
                                     val length = target.length()
                                     writtenBytes.addAndGet(length)
                                     // 也计入「已读」：续传任务的进度条从上次的位置接着走，不从 0 开始
-                                    downloadedBytes.addAndGet(length)
+                                    noteJobBytes(job.fileName, length)
                                     writtenDurationMs.addAndGet(job.durationMs)
                                     return@withPermit
                                 }
@@ -137,14 +152,14 @@ object M3U8Downloader {
                                     if (attempt > 1) delay(RETRY_BACKOFF_MS * (attempt - 1))
                                     activeConn.incrementAndGet()
                                     try {
-                                        // 边读边把字节数累加到进度计数器上：分片往往有好几 MB，
+                                        // 边读边累加到进度计数器：分片往往有好几 MB，
                                         // 等下完再报就是「一格一格跳」，大分片时看起来像卡住不动
-                                        val result = fetchAndPrepare(job, keyCache) { read ->
-                                            downloadedBytes.addAndGet(read)
+                                        var attemptRead = 0L
+                                        fetchSegmentToFile(job, referer, keyCache, target) { read ->
+                                            attemptRead += read
+                                            noteJobBytes(job.fileName, attemptRead)
                                         }
-                                        writeAtomically(target, result)
-                                        // result.size 是 Int，AtomicLong.addAndGet 需要 Long
-                                        writtenBytes.addAndGet(result.size.toLong())
+                                        writtenBytes.addAndGet(target.length())
                                         writtenDurationMs.addAndGet(job.durationMs)
                                         lastError = null
                                         break
@@ -202,8 +217,8 @@ object M3U8Downloader {
     /**
      * 取媒体层 playlist：master 则选码率最高的变体再拉一次。
      */
-    private suspend fun resolveMediaPlaylist(playlistUrl: String): HlsPlaylist.Media? {
-        val text = fetch(playlistUrl) ?: throw IOException("playlist 请求失败")
+    private suspend fun resolveMediaPlaylist(playlistUrl: String, referer: String): HlsPlaylist.Media? {
+        val text = fetch(playlistUrl, referer) ?: throw IOException("playlist 请求失败")
         return when (val parsed = M3U8Parser.parse(text, playlistUrl)) {
             is HlsPlaylist.Media -> parsed
             is HlsPlaylist.Master -> {
@@ -211,7 +226,7 @@ object M3U8Downloader {
                 val best = parsed.variants.maxWithOrNull(
                     compareBy({ it.bandwidth }, { resolutionRank(it.resolution) })
                 ) ?: return null
-                val subText = fetch(best.uri) ?: throw IOException("子 playlist 请求失败")
+                val subText = fetch(best.uri, referer) ?: throw IOException("子 playlist 请求失败")
                 val sub = M3U8Parser.parse(subText, best.uri)
                 if (sub is HlsPlaylist.Media) sub else null
             }
@@ -285,51 +300,81 @@ object M3U8Downloader {
     // ---------- transfer ----------
 
     /**
-     * 拉取分片原始数据并解密，返回可直接落盘的字节。
+     * 拉取一个分片并**流式**解密写入 [target]。
+     *
+     * 旧实现用 `ByteArrayOutputStream` 把整个分片收进内存、再 `decrypt` 复制一份：
+     * 峰值 ≈ 2 × 分片大小 × 并发数（8 线程 × 10 MB ≈ 160 MB+），低内存机型会 OOM。
+     * 现在密文边读边解边写，内存占用只剩一个 [COPY_BUFFER]。
+     *
      * 任何失败都抛异常（由调用方重试并汇总）。
      *
-     * @param onBytesRead 每读到一段就回调其长度；进度条靠它连续推进（见 [download] 里的 ticker）
+     * @param onBytesRead 每读到一段就回调其长度；进度条靠它连续推进
      */
-    private suspend fun fetchAndPrepare(
+    private fun fetchSegmentToFile(
         job: Job,
+        referer: String,
         keyCache: MutableMap<String, ByteArray>,
+        target: File,
         onBytesRead: (Long) -> Unit
-    ): ByteArray {
-        val request = buildRequest(job)
-        val raw = SnifferHttp.client.newCall(request).execute().use { resp ->
-            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
-            val body = resp.body ?: throw IOException("响应为空")
-            readFully(body, onBytesRead)
-        }
-        if (raw.isEmpty()) throw IOException("分片为空")
+    ) {
+        val request = buildRequest(job, referer)
+        val tmp = File(target.parentFile, target.name + ".part")
+        try {
+            SnifferHttp.client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+                val body = resp.body ?: throw IOException("响应为空")
 
-        if (!job.key.isEncrypted) return raw
+                val key: ByteArray? = if (job.key.isEncrypted) {
+                    if (!job.key.method.equals(HlsCrypto.METHOD_AES_128, true)) {
+                        throw IOException("不支持的加密方式 ${job.key.method}")
+                    }
+                    val keyUri = job.key.keyUri ?: throw IOException("缺少密钥地址")
+                    keyCache[keyUri] ?: fetchKey(keyUri, referer).also { keyCache[keyUri] = it }
+                } else {
+                    null
+                }
 
-        if (!job.key.method.equals(HlsCrypto.METHOD_AES_128, true)) {
-            throw IOException("不支持的加密方式 ${job.key.method}")
+                body.byteStream().use { raw ->
+                    // 计数包在解密之前：进度按「网络上真正读到的字节」计，
+                    // 解密后的长度会因填充少 1~16 字节，和进度分母口径不一致。
+                    val counted = CountingInputStream(raw, onBytesRead)
+                    val source: InputStream = if (key != null) {
+                        val iv = HlsCrypto.parseIv(job.key.iv) ?: HlsCrypto.ivFromSequence(job.ivSeed)
+                        HlsCrypto.decryptStream(counted, key, iv)
+                    } else {
+                        counted
+                    }
+                    FileOutputStream(tmp).use { out -> source.copyTo(out, COPY_BUFFER) }
+                }
+            }
+            if (tmp.length() <= 0L) throw IOException("分片为空")
+            // 先写 .part 再原子改名，避免中断留下半截文件被当作「已完成」
+            if (target.exists()) target.delete()
+            if (!tmp.renameTo(target)) throw IOException("重命名失败")
+        } catch (e: Exception) {
+            tmp.delete()
+            throw e
         }
-        val keyUri = job.key.keyUri ?: throw IOException("缺少密钥地址")
-        val key = keyCache[keyUri] ?: fetchKey(keyUri).also { keyCache[keyUri] = it }
-        val iv = HlsCrypto.parseIv(job.key.iv) ?: HlsCrypto.ivFromSequence(job.ivSeed)
-        return HlsCrypto.decrypt(raw, key, iv)
     }
 
-    private fun buildRequest(job: Job): Request {
+    private fun buildRequest(job: Job, referer: String): Request {
         val builder = Request.Builder()
             .url(job.uri)
-            .header("User-Agent", SnifferHttp.UA)
+            .header("User-Agent", SnifferHttp.downloadUserAgent)
+        // 防盗链：分片与密钥都要带来源页，缺了就是 403
+        if (referer.isNotBlank()) builder.header("Referer", referer)
         job.byteRange?.let { range ->
             builder.header("Range", "bytes=${range.offset}-${range.offset + range.length - 1}")
         }
         return builder.build()
     }
 
-    private fun fetchKey(keyUri: String): ByteArray {
-        val request = Request.Builder()
+    private fun fetchKey(keyUri: String, referer: String): ByteArray {
+        val builder = Request.Builder()
             .url(keyUri)
-            .header("User-Agent", SnifferHttp.UA)
-            .build()
-        return SnifferHttp.client.newCall(request).execute().use { resp ->
+            .header("User-Agent", SnifferHttp.downloadUserAgent)
+        if (referer.isNotBlank()) builder.header("Referer", referer)
+        return SnifferHttp.client.newCall(builder.build()).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("密钥请求失败 HTTP ${resp.code}")
             val bytes = resp.body?.bytes() ?: throw IOException("密钥为空")
             if (bytes.size != 16) throw IOException("密钥长度异常(${bytes.size})")
@@ -337,41 +382,22 @@ object M3U8Downloader {
         }
     }
 
-    /**
-     * 读完整段响应体，并**边读边回报**已读字节数。
-     *
-     * 这里刻意不用 `body.bytes()`：它一次性读完，中途没有任何进度可报。
-     * 分片普遍有好几 MB，下完才动一格 → 分片大/分片少的源看上去就是「进度条不更新」。
-     */
-    private fun readFully(body: ResponseBody, onBytesRead: (Long) -> Unit): ByteArray {
-        val declared = body.contentLength()
-        val buffer = ByteArray(COPY_BUFFER)
-        // Content-Length 只用来预分配（不可全信，故设上限）
-        val out = ByteArrayOutputStream(
-            if (declared in 1L..MAX_PREFETCH_BYTES) declared.toInt() else COPY_BUFFER
-        )
-        body.byteStream().use { input ->
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                out.write(buffer, 0, read)
-                onBytesRead(read.toLong())
-            }
-        }
-        return out.toByteArray()
-    }
+    /** 统计读到的原始字节数（解密前的密文长度），用于进度上报。 */
+    private class CountingInputStream(
+        delegate: InputStream,
+        private val onRead: (Long) -> Unit
+    ) : FilterInputStream(delegate) {
 
-    /** 先写 .tmp 再原子改名，避免中断留下半截文件被当作「已完成」。 */
-    private fun writeAtomically(target: File, data: ByteArray) {
-        val tmp = File(target.parentFile, target.name + ".tmp")
-        try {
-            FileOutputStream(tmp).use { it.write(data) }
-            if (tmp.length() <= 0) throw IOException("写入为空")
-            if (target.exists()) target.delete()
-            if (!tmp.renameTo(target)) throw IOException("重命名失败")
-        } catch (e: Exception) {
-            tmp.delete()
-            throw e
+        override fun read(): Int {
+            val b = super.read()
+            if (b >= 0) onRead(1L)
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val n = super.read(b, off, len)
+            if (n > 0) onRead(n.toLong())
+            return n
         }
     }
 
@@ -384,13 +410,13 @@ object M3U8Downloader {
     private fun allJobsPresent(jobs: List<Job>, workDir: File): Boolean =
         jobs.all { jobPresent(it, workDir) }
 
-    private suspend fun fetch(url: String): String? = withContext(Dispatchers.IO) {
+    private suspend fun fetch(url: String, referer: String): String? = withContext(Dispatchers.IO) {
         try {
-            val request = Request.Builder()
+            val builder = Request.Builder()
                 .url(url)
-                .header("User-Agent", SnifferHttp.UA)
-                .build()
-            SnifferHttp.client.newCall(request).execute().use { resp ->
+                .header("User-Agent", SnifferHttp.downloadUserAgent)
+            if (referer.isNotBlank()) builder.header("Referer", referer)
+            SnifferHttp.client.newCall(builder.build()).execute().use { resp ->
                 if (!resp.isSuccessful) null else resp.body?.string()
             }
         } catch (_: Exception) {

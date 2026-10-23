@@ -12,6 +12,7 @@ import androidx.fragment.app.Fragment
 import com.videosniffer.R
 import com.videosniffer.core.SettingsStore
 import com.videosniffer.download.DownloadManager
+import com.videosniffer.sniff.SnifferHttp
 
 /**
  * 设置页：线程数、同时下载任务数、初始网站、电脑版网页。
@@ -79,6 +80,10 @@ class SettingsFragment : Fragment(R.layout.fragment_settings) {
             // 必须与写入的顺序一致：先比较旧值，再落库
             val desktopChanged = switchDesktop.isChecked != settings.desktopMode
             settings.desktopMode = switchDesktop.isChecked
+
+            // 下载请求的 UA 跟随这个开关：桌面模式拿到的直链用移动 UA 去下常被站点拒。
+            // 解析器仍用固定移动 UA（见 SnifferHttp.UA），这里只切「下载用」那一份。
+            SnifferHttp.downloadUserAgent = SnifferHttp.uaFor(settings.desktopMode)
 
             val message = when {
                 pageChanged -> R.string.settings_initial_page_applied

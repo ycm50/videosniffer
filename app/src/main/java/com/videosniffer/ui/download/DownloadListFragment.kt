@@ -73,8 +73,18 @@ class DownloadListFragment : Fragment(R.layout.fragment_downloads) {
         }
     }
 
+    private var lastSubmitted: List<DownloadTask>? = null
+
     private fun render(tasks: List<DownloadTask>, empty: TextView) {
-        adapter.submitList(tasks)
+        // 同一个快照实例 = 自上次渲染以来没有任何变化，跳过 submitList。
+        //
+        // 这不是「只在有活跃任务时刷新」那种会漏刷的条件（暂停/完成时活跃数为 0，
+        // 恰好就是该刷新的瞬间）。这里判断的是「快照实例有没有换过」：
+        // StateFlow 每次发布都是新实例，因此漏推送时轮询通道依然能把变化兜住。
+        if (tasks !== lastSubmitted) {
+            lastSubmitted = tasks
+            adapter.submitList(tasks)
+        }
         empty.isVisible = tasks.isEmpty()
     }
 

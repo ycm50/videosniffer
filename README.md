@@ -14,10 +14,11 @@
 | 浏览器 | 系统 WebView，地址栏/前进后退/刷新，起始站点可在设置里改；可切「电脑版网页」（桌面 UA + 桌面视口） |
 | 资源嗅探 | **双通道**：页面解析（Route D，主）+ 请求级拦截（Route A，兜底） |
 | 站点解析器 | hanime1.me（下载页表格）、Pornhub（flashvars JSON）、YouTube（InnerTube 免 JS 多客户端 + 请求级拦截兜底） |
-| mp4 下载 | Range 探测 → 按线程数分片并发 → `RandomAccessFile` 区间写；断点续传 |
-| m3u8 下载 | master/media 解析、`#EXT-X-MAP`（fMP4）、`#EXT-X-BYTERANGE`、**AES-128 解密** |
-| 任务管理 | 并发上限排队、暂停/继续/取消/重试/删除、失败原因展示 |
-| 后台下载 | `dataSync` 前台服务 + 进度通知 |
+| mp4 下载 | Range 探测 → 按线程数分片并发 → `RandomAccessFile` 区间写；断点续传；分片进度**边下边落库** |
+| m3u8 下载 | master/media 解析、`#EXT-X-MAP`（fMP4）、`#EXT-X-BYTERANGE`、**AES-128 流式解密**（不整段进内存） |
+| 任务管理 | 并发上限排队、暂停/继续/取消/重试/删除、失败原因展示、**断网自动暂停**（保留进度，联网后继续） |
+| 后台下载 | `dataSync` 前台服务 + 进度通知；**多任务并发时显示聚合进度** |
+| 下载 UA | 跟随「电脑版网页」开关（桌面模式拿到的直链用桌面 UA 去下）；嗅探/解析仍用固定移动 UA |
 | 导出 | MediaStore 写入 `/Download/hanime1/`，minSdk 29 下**无需存储权限** |
 
 ## 目录结构
@@ -52,7 +53,8 @@ app/src/main/java/com/videosniffer/
 [App设计方案.md](docs/App设计方案.md) ·
 [资源嗅探技术调研.md](docs/资源嗅探技术调研.md) ·
 [多线程下载技术调研.md](docs/多线程下载技术调研.md) ·
-[变更验证清单.md](docs/变更验证清单.md)
+[变更验证清单.md](docs/变更验证清单.md) ·
+[优化验证清单.md](docs/优化验证清单.md)
 
 ## 构建
 
@@ -67,8 +69,10 @@ echo "sdk.dir=/path/to/Android/Sdk" > local.properties
 ./gradlew assembleRelease
 ```
 
-CI 见 [`.github/workflows/release.yml`](.github/workflows/release.yml)：手动触发后自动递增版本号
-（v1.0 → v1.1 → …）、构建并发布 Release APK。
+CI 见 [`.github/workflows/`](.github/workflows/)：
+
+- `ci.yml` — push / PR 跑 `testDebugUnitTest` + `assembleDebug`，失败时上传测试报告；
+- `release.yml` — 手动触发后自动递增版本号（v1.0 → v1.1 → …）、构建并发布 Release APK。
 
 ## 测试
 
@@ -76,15 +80,29 @@ CI 见 [`.github/workflows/release.yml`](.github/workflows/release.yml)：手动
 ./gradlew testDebugUnitTest
 ```
 
-单元测试聚焦**纯逻辑**（不依赖 Android 框架，可在 JVM 直接跑），共 7 个测试类：
+单元测试聚焦**纯逻辑**（不依赖 Android 框架，可在 JVM 直接跑），共 12 个测试类（102 个用例）：
 
 - `M3U8ParserTest` — master/media playlist、`EXT-X-KEY`/`MAP`/`BYTERANGE`、相对 URL 解析
-- `HlsCryptoTest` — IV 解析与推导、AES-128-CBC 加解密往返、不支持算法的拒绝
+- `HlsCryptoTest` — IV 解析与推导、AES-128-CBC 加解密往返、**流式解密**往返、不支持算法的拒绝
 - `ShardCalculatorTest` — 分片区间覆盖性与边界、`index` 线程数编码
-- `MediaUrlDetectorTest` — Content-Type 映射、扩展名提取、清晰度提取
-- `Hanime1DownloadParserTest` — 文件名去扩展名/去清晰度后缀、网页标题剥站点尾巴
+- `ShardProgressThrottleTest` — 分片进度落库的节流规则（时间/字节两个触发条件）
+- `DownloadProgressTest` — 字节进度换算、m3u8 总量估算、下载中不显示 100%
 - `DownloadTaskPublishTest` — 钉住「发布不可变快照」的约定（StateFlow 相等性判重那一课）
+- `DownloadFailureClassifierTest` — 网络瞬断类失败 vs 确定性失败（断网暂停的判据）
+- `MediaUrlDetectorTest` — Content-Type 映射、扩展名提取、清晰度提取
+- `DetectedMediaTest` — 媒体条目模型
+- `Hanime1DownloadParserTest` — 文件名去扩展名/去清晰度后缀、网页标题剥站点尾巴
 - `YouTubeParserTest` — videoId 提取、mimeType 分类、itag→清晰度、`signatureCipher`/花括号 JSON/`ytcfg` 解析、`range` 归一化
+- `SnifferHttpTest` — 嗅探 UA 固定、下载 UA 跟随「电脑版网页」开关
+
+仪器测试（需设备，CI 不跑）：
+
+```bash
+./gradlew connectedDebugAndroidTest
+```
+
+- `UriDependentTest` — 依赖 `android.net.Uri` 的判定：`isVideoCandidate`、`normalizeForDownload`、
+  `extensionOf/extensionFor`、`YouTubeParser.matches`
 
 > 依赖 `android.net.Uri` 的判定（`MediaUrlDetector.isVideoCandidate`、`detect`、`YouTubeParser.matches`）
 > 需在仪器测试（`androidTest`）中验证，因此上述纯逻辑都已拆成不碰 `Uri` 的函数。
@@ -110,6 +128,22 @@ CI 见 [`.github/workflows/release.yml`](.github/workflows/release.yml)：手动
 - **OkHttp 调优**：`maxRequestsPerHost` 提到 64，否则默认为 5 会把多线程压成单机五连。
 - **随机写**：分片用 `RandomAccessFile("rw")` 而非 `"rwd"`，避免每写同步落盘拖垮并发。
 - **加密流**：`SAMPLE-AES` 等不支持算法会**显式失败**，不会静默产出无法播放的成品。
+- **m3u8 流式解密**：分片不再整段进内存（旧实现峰值 ≈ 2 × 分片大小 × 并发数，
+  8 线程 × 10 MB ≈ 160 MB+，低内存机型会 OOM），改为 `CipherInputStream` 边读边解边写 `.part`，
+  完成后原子改名；内存占用只剩一个 256 KB 缓冲区。
+- **进度落库节流**：单文件分片此前只在**分片结束**时写一次库，1 GB / 8 线程 = 128 MB 一片，
+  中途被杀就整片归零。现在按「2 秒或 16 MB」落一次，最多丢 2 秒进度。
+- **DB 写入单线程**：暂停/删除由 UI 点击触发，同步写 SQLite 会在主线程产生 IO 抖动；
+  改由一条名为 `download-db` 的单线程队列串行执行。用单线程而不是 `Dispatchers.IO`，
+  是为了保证同一任务的「更新 → 删除」提交顺序，避免删掉的行被后到的 update 复活。
+- **列表增量刷新**：`ListAdapter + DiffUtil` 取代 `notifyDataSetChanged()`；进度每 300ms 上报一次，
+  全量重绑会把所有可见项（按钮/进度条/文本）重建一遍。轮询兜底通道另加「快照实例未变则跳过」，
+  既保留「漏推送也能自愈」的能力，又不重复做 diff。
+- **断网 → 暂停而非失败**：判据是「当前无互联网连接 **或** 错误文本属于网络瞬断类」。
+  只看连接状态在常驻 VPN 的设备上会失效（飞行模式下 `activeNetwork` 仍是 VPN 且声称有
+  `NET_CAPABILITY_INTERNET`），而分片重试又常早于 2 秒宽限期失败，所以两条判据缺一不可。
+- **UA 分两份**：嗅探/解析用固定移动 UA（靠它过防盗链），下载用 UA 跟随「电脑版网页」开关 ——
+  桌面模式拿到的直链用移动 UA 去下会被站点拒。
 
 ## 免责声明
 

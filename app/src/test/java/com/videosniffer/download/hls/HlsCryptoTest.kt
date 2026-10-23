@@ -87,6 +87,59 @@ class HlsCryptoTest {
     }
 
     @Test
+    fun `流式解密与整段解密结果一致`() {
+        // 300 KB：超过缓冲区，能覆盖「多次 read 拼起来」的路径
+        val plaintext = ByteArray(300_000) { (it % 251).toByte() }
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        val ciphertext = cipher.doFinal(plaintext)
+
+        // 故意用 1024 字节的小块返回，模拟网络流的碎片化读取
+        val source = object : java.io.InputStream() {
+            private var pos = 0
+
+            override fun read(): Int =
+                if (pos >= ciphertext.size) -1 else ciphertext[pos++].toInt() and 0xFF
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (pos >= ciphertext.size) return -1
+                val n = minOf(len, 1024, ciphertext.size - pos)
+                System.arraycopy(ciphertext, pos, b, off, n)
+                pos += n
+                return n
+            }
+        }
+
+        val out = java.io.ByteArrayOutputStream()
+        HlsCrypto.decryptStream(source, key, iv).use { it.copyTo(out) }
+        assertArrayEquals(plaintext, out.toByteArray())
+    }
+
+    @Test
+    fun `流式解密对错误密钥抛异常`() {
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        val ciphertext = cipher.doFinal("payload-for-wrong-key".toByteArray())
+
+        val failed = runCatching {
+            HlsCrypto.decryptStream(
+                java.io.ByteArrayInputStream(ciphertext),
+                ByteArray(16) { 9 },
+                iv
+            ).use { it.readBytes() }
+        }
+        assertTrue(failed.isFailure)
+    }
+
+    @Test
+    fun `流式解密拒绝非法密钥长度`() {
+        val failed = runCatching {
+            HlsCrypto.decryptStream(java.io.ByteArrayInputStream(ByteArray(16)), ByteArray(8), iv)
+        }
+        assertTrue(failed.isFailure)
+    }
+
+    @Test
     fun `HlsKey isEncrypted 判定`() {
         assertFalse(HlsKey.NONE.isEncrypted)
         assertEquals(false, HlsKey("NONE", null, null).isEncrypted)

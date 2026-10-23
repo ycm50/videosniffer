@@ -2,6 +2,9 @@ package com.videosniffer.download
 
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Environment
 import com.videosniffer.core.DownloadService
 import com.videosniffer.core.SettingsStore
@@ -10,11 +13,14 @@ import com.videosniffer.download.engine.SingleFileDownloader
 import com.videosniffer.download.hls.M3U8Downloader
 import com.videosniffer.download.export.MediaStoreExporter
 import com.videosniffer.sniff.DetectedMedia
+import com.videosniffer.sniff.SnifferHttp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -22,6 +28,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 /**
  * 下载调度器（单例）。
@@ -63,6 +70,27 @@ object DownloadManager {
     @Volatile
     private var initialized = false
 
+    /**
+     * 所有 SQLite 写入都排到这一条线程上。
+     *
+     * 为什么不是直接在主线程写：`pauseTask` / `deleteTask` / `enqueue` 都由 UI 点击触发，
+     * 同步写库会在点击瞬间产生磁盘 IO 抖动（低端机有 ANR 风险）。
+     * 为什么不是 `Dispatchers.IO`：那里是多线程，同一任务的「更新 → 删除」可能乱序，
+     * 删掉的行会被后面的 update 复活。单线程队列天然保证提交顺序。
+     */
+    private val dbDispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "download-db").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
+
+    /** 异步落库；异常只记录不打断调用方（持久化失败不应影响下载本身）。 */
+    private fun persist(block: () -> Unit) {
+        scope.launch(dbDispatcher) { runCatching(block) }
+    }
+
+    /** 用于「断网判定」，在 [init] 里取得；为空时视为网络可用（不改变既有语义）。 */
+    @Volatile
+    private var connectivity: ConnectivityManager? = null
+
     /** 需要前台服务保持存活的状态集合（含排队：等待补位的任务也必须保住进程）。 */
     private val aliveStates = setOf(
         DownloadState.QUEUED, DownloadState.PENDING, DownloadState.PROBING,
@@ -78,11 +106,21 @@ object DownloadManager {
         DownloadState.COMPLETED, DownloadState.FAILED, DownloadState.EXPORTING
     )
 
+    /**
+     * 初始化（幂等）。
+     *
+     * 加 `@Synchronized`：`DownloadService.onCreate` 与 `MainActivity` 都可能触发初始化，
+     * 而「读 initialized → 加载 → 置位」是 check-then-act，并发时会重复 `loadTasks`
+     * 与重复 `pumpQueue`（后者会让同一任务被调度两次）。
+     */
+    @Synchronized
     fun init(context: Context) {
         if (initialized) return
         appContext = context.applicationContext
         db = DownloadDbHelper(appContext)
         settingsStore = SettingsStore(appContext)
+        // 下载请求的 UA 跟随「电脑版网页」设置：桌面模式拿到的直链，用移动 UA 去下常被拒
+        SnifferHttp.downloadUserAgent = SnifferHttp.uaFor(settingsStore.desktopMode)
         // 进程被杀后：运行中/排队中任务统一回到 QUEUED，由调度器重新补位。
         // 单文件任务的分片进度存在 shards 表，m3u8 任务的已下载分片存在私有目录，均可续传。
         // 用 runCatching 兜底：本方法会被 Service.onCreate 调用，
@@ -96,7 +134,11 @@ object DownloadManager {
                 }
             }
         }.getOrDefault(emptyList())
+        connectivity = runCatching {
+            appContext.getSystemService(ConnectivityManager::class.java)
+        }.getOrNull()
         initialized = true
+        registerNetworkMonitor()
         pumpQueue()
     }
 
@@ -115,7 +157,7 @@ object DownloadManager {
             m3u8Url = if (media.ext.equals("m3u8", true)) media.url else null,
             state = DownloadState.QUEUED
         )
-        db.insertTask(task)
+        persist { db.insertTask(task) }
         _tasks.update { it + task }
         startForegroundService()
         pumpQueue()
@@ -204,7 +246,7 @@ object DownloadManager {
         stopSignals[id]?.requestCancel()
         activeJobs[id]?.cancel()
         val task = _tasks.value.firstOrNull { it.id == id }
-        runCatching { db.deleteTask(id) }
+        persist { db.deleteTask(id) }
         task?.let { deleteFiles(it) }
         _tasks.update { list -> list.filterNot { it.id == id } }
         pumpQueue()
@@ -217,7 +259,7 @@ object DownloadManager {
         }
         if (finished.isEmpty()) return
         finished.forEach { task ->
-            runCatching { db.deleteTask(task.id) }
+            persist { db.deleteTask(task.id) }
             deleteFiles(task)
         }
         val finishedIds = finished.mapTo(mutableSetOf()) { it.id }
@@ -333,6 +375,22 @@ object DownloadManager {
             finishStopped(task)
             return
         }
+        // 断网导致的失败按「暂停」处理。
+        //
+        // 两个判据任一成立即可：
+        // 1. 当前没有互联网连接（普通设备飞行模式）；
+        // 2. 失败文本是网络瞬断类（设备常驻 VPN 时，飞行模式下 activeNetwork 仍报有
+        //    INTERNET，只看连接状态会永远判成「失败」，见 [DownloadFailureClassifier]）。
+        //
+        // 只靠 NetworkCallback 也不可靠：真机实测中分片的 3 次重试往往在 2 秒宽限期内
+        // 就全部失败，任务先变成 FAILED，用户看到的是「失败 + 重试」而不是「已暂停 + 继续」。
+        if (!hasInternet() || DownloadFailureClassifier.isTransientNetworkFailure(message)) {
+            task.state = DownloadState.PAUSED
+            task.error = "网络已断开，已自动暂停"
+            task.activeConnections = 0
+            updateTask(task)
+            return
+        }
         task.state = DownloadState.FAILED
         task.error = message
         task.activeConnections = 0
@@ -342,7 +400,7 @@ object DownloadManager {
     /** 取消：删记录 + 删文件 + 从列表移除 */
     private fun removeTaskCompletely(task: DownloadTask) {
         deleteFiles(task)
-        runCatching { db.deleteTask(task.id) }
+        persist { db.deleteTask(task.id) }
         _tasks.update { list -> list.filterNot { it.id == task.id } }
     }
 
@@ -397,7 +455,7 @@ object DownloadManager {
      *    放入副本后，列表里的旧快照保留旧值，值一变就不再相等，通知才发得出去。
      */
     private fun updateTask(task: DownloadTask) {
-        runCatching { db.updateTask(task) }
+        persist { db.updateTask(task) }
         val snapshot = task.copy()
         _tasks.update { list -> list.map { if (it.id == snapshot.id) snapshot else it } }
     }
@@ -415,7 +473,7 @@ object DownloadManager {
         _tasks.update { list ->
             list.map { t -> if (t.id == id) transform(t).also { snapshot = it } else t }
         }
-        snapshot?.let { runCatching { db.updateTask(it) } }
+        snapshot?.let { t -> persist { db.updateTask(t) } }
     }
 
     /** 把私有临时文件导出到 /Download/hanime1/，返回是否成功 */
@@ -445,7 +503,53 @@ object DownloadManager {
         }
     }
 
+    // ---------- 网络监听 ----------
+
+    /**
+     * 断网时把正在下载的任务**暂停**，而不是让它们一路重试到失败。
+     *
+     * 失败态会丢掉「可续传」的语义（用户看到的是「失败 + 重试按钮」，
+     * 而实际上只是网断了），暂停则保留进度、联网后点一下就能继续。
+     *
+     * 延迟 [NETWORK_LOSS_GRACE_MS] 再判定：切换 Wi-Fi/蜂窝时 `onLost` 会先到、
+     * 新网络随后就到，立即暂停会造成无谓的抖动。
+     */
+    private fun registerNetworkMonitor() {
+        val cm = connectivity ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onLost(network: Network) {
+                    scope.launch {
+                        delay(NETWORK_LOSS_GRACE_MS)
+                        if (!hasInternet()) pauseRunningForNetworkLoss()
+                    }
+                }
+            })
+        }
+    }
+
+    /** 当前是否有可用互联网连接；拿不到 ConnectivityManager 时按「有」处理。 */
+    private fun hasInternet(): Boolean {
+        val cm = connectivity ?: return true
+        val active = runCatching { cm.activeNetwork }.getOrNull() ?: return false
+        val capabilities = runCatching { cm.getNetworkCapabilities(active) }.getOrNull()
+            ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun pauseRunningForNetworkLoss() {
+        val running = _tasks.value.filter {
+            it.state == DownloadState.PENDING ||
+                it.state == DownloadState.PROBING ||
+                it.state == DownloadState.DOWNLOADING
+        }
+        running.forEach { pauseTask(it.id) }
+    }
+
     // 说明：前台服务的停止由 DownloadService 自身订阅 tasks 后决定
     //（无存活任务即 stopSelf）。此前在调度器里额外做一次「空闲则 stopService」，
     // 会与并发的 enqueue/pumpQueue 竞争，可能把刚启动的服务杀掉，故移除。
+
+    /** 断网后等这么久再判定：Wi-Fi/蜂窝切换时 onLost 会先到，新网络随后就到。 */
+    private const val NETWORK_LOSS_GRACE_MS = 2_000L
 }

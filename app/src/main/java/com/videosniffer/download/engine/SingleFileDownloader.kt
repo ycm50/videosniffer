@@ -191,13 +191,16 @@ object SingleFileDownloader {
             var offset = shard.start + shard.finished
             raf.seek(offset)
             val buffer = ByteArray(BUFFER_SIZE)
+            // 进度落库节流：分片结束时才写库的话，一个 128 MB 的分片中途被杀就全丢
+            var lastPersistAt = System.currentTimeMillis()
+            var lastPersistedBytes = shard.finished
             while (offset <= shard.end) {
                 currentCoroutineContext().ensureActive()
                 if (stopped.isStopped) return
 
                 val req = Request.Builder()
                     .url(task.url)
-                    .header("User-Agent", SnifferHttp.UA)
+                    .header("User-Agent", SnifferHttp.downloadUserAgent)
                     .header("Referer", task.sourcePageUrl)
                     .header("Range", "bytes=$offset-${shard.end}")
                     .build()
@@ -222,6 +225,16 @@ object SingleFileDownloader {
                                 offset += n
                                 shard.finished += n
                                 sessionBytes.addAndGet(n.toLong())
+
+                                val now = System.currentTimeMillis()
+                                if (ShardProgressThrottle.shouldPersist(
+                                        lastPersistAt, now, lastPersistedBytes, shard.finished
+                                    )
+                                ) {
+                                    lastPersistAt = now
+                                    lastPersistedBytes = shard.finished
+                                    runCatching { db.updateShard(task.id, shard) }
+                                }
                             }
                         }
                     }
@@ -277,7 +290,7 @@ object SingleFileDownloader {
         try {
             val req = Request.Builder()
                 .url(task.url)
-                .header("User-Agent", SnifferHttp.UA)
+                .header("User-Agent", SnifferHttp.downloadUserAgent)
                 .header("Referer", task.sourcePageUrl)
                 .build()
 
@@ -326,7 +339,7 @@ object SingleFileDownloader {
         return try {
             val req = Request.Builder()
                 .url(url)
-                .header("User-Agent", SnifferHttp.UA)
+                .header("User-Agent", SnifferHttp.downloadUserAgent)
                 .header("Referer", referer)
                 .header("Range", "bytes=0-0")
                 .build()
